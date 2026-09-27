@@ -133,7 +133,7 @@ func (m *Merlin) Setup() (retErr error) {
 	// Apply NVRAM changes before regenerating dnsmasq so the firmware-generated
 	// config reflects ctrld's desired DNS Privacy state. nvram.SetKV rolls back
 	// its own partial mutations on failure.
-	if err := nvram.SetKV(nvramKvMap, nvram.CtrldSetupKey); err != nil {
+	if err := nvram.SetKVWithVolatileRetryMarker(nvramKvMap, nvram.CtrldSetupKey); err != nil {
 		return err
 	}
 
