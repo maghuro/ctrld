@@ -92,6 +92,39 @@ func (s *merlinSvc) renderStartupScripts(exePath string) (current, legacy []byte
 	return currentBuf.Bytes(), legacyBuf.Bytes(), nil
 }
 
+// RefreshMerlinStartupScriptFromRunningBinary migrates an exact ctrld-owned
+// legacy startup script from code executed by the newly launched binary.
+//
+// This is intentionally separate from merlinSvc.Start: during self-upgrade the
+// process that calls Service.Start is still the old binary even after the
+// executable on disk has been replaced. The new `ctrld run` process is the
+// first reliable place where new lifecycle code is guaranteed to execute.
+//
+// Missing service state and user-custom startup scripts are harmless no-ops.
+// Transient migration errors are returned to the caller, which should log and
+// continue starting ctrld so the next daemon start can retry safely.
+func RefreshMerlinStartupScriptFromRunningBinary() error {
+	exePath, err := os.Executable()
+	if err != nil {
+		return err
+	}
+
+	s := &merlinSvc{
+		Config: &service.Config{
+			Name:       "ctrld",
+			Executable: exePath,
+		},
+	}
+
+	return withMerlinServiceLock(func() error {
+		err := s.refreshMerlinStartupScript()
+		if errors.Is(err, service.ErrNotInstalled) {
+			return nil
+		}
+		return err
+	})
+}
+
 func (s *merlinSvc) refreshMerlinStartupScript() error {
 	exePath := s.Config.Executable
 	if exePath == "" {
