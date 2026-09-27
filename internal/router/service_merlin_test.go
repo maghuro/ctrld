@@ -35,7 +35,9 @@ func TestMerlinServiceRestartStopsBeforeStarting(t *testing.T) {
 func TestMerlinServiceHookEditorIsIdempotent(t *testing.T) {
 	for _, want := range []string{
 		`if grep -qxF "$line" "$file"; then`,
-		`pc_append "$line" "$file"`,
+		`grep_status=$?`,
+		`[ "$grep_status" -eq 1 ] || exit "$grep_status"`,
+		`pc_append "$line" "$file" || exit $?`,
 		`printf 'added\n'`,
 	} {
 		if !strings.Contains(merlinAddLineToScript, want) {
