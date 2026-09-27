@@ -519,11 +519,11 @@ func Test_dnsmasqConfigUsesCtrld(t *testing.T) {
 
 func Test_legacyCleanupJournalRoundTrip(t *testing.T) {
 	entries := []legacySnapshotEntry{
-		{path: dnsmasq.MerlinJffsConfPath, hash: merlinSnapshotHash([]byte("main"))},
-		{path: filepath.Join(dnsmasq.MerlinJffsConfDir, "dnsmasq-1.conf"), hash: merlinSnapshotHash([]byte("sdn1"))},
-		{path: filepath.Join(dnsmasq.MerlinJffsConfDir, "dnsmasq-3.conf"), hash: merlinSnapshotHash([]byte("sdn3"))},
+		{state: legacyEntryPending, path: dnsmasq.MerlinJffsConfPath, hash: merlinSnapshotHash([]byte("main"))},
+		{state: legacyEntryDelete, path: filepath.Join(dnsmasq.MerlinJffsConfDir, "dnsmasq-1.conf"), hash: merlinSnapshotHash([]byte("sdn1"))},
+		{state: legacyEntryRestore, path: filepath.Join(dnsmasq.MerlinJffsConfDir, "dnsmasq-3.conf"), hash: merlinSnapshotHash([]byte("sdn3"))},
 	}
-	want := legacyCleanupJournal{phase: "cleanup-v1", entries: entries}
+	want := legacyCleanupJournal{phase: legacyCleanupPhase, entries: entries}
 	buf, err := encodeLegacyCleanupJournal(want)
 	if err != nil {
 		t.Fatal(err)
@@ -544,20 +544,28 @@ func Test_legacyCleanupJournalRoundTrip(t *testing.T) {
 
 func Test_parseLegacyCleanupJournalRejectsUnsafePath(t *testing.T) {
 	hash := merlinSnapshotHash([]byte("x"))
-	buf := []byte("cleanup-v1\n/jffs/configs/profile.add\t" + hash + "\n")
+	buf := []byte(legacyCleanupPhase + "\n" + legacyEntryPending + "\t/jffs/configs/profile.add\t" + hash + "\n")
 	if _, err := parseLegacyCleanupJournal(buf); err == nil {
 		t.Fatal("expected unsafe legacy snapshot path to be rejected")
 	}
 }
 
 func Test_parseLegacyCleanupJournalFinalizeHasNoEntries(t *testing.T) {
-	if _, err := parseLegacyCleanupJournal([]byte("finalize\n")); err != nil {
+	if _, err := parseLegacyCleanupJournal([]byte(legacyFinalizePhase + "\n")); err != nil {
 		t.Fatalf("valid finalize journal rejected: %v", err)
 	}
 	hash := merlinSnapshotHash([]byte("x"))
-	buf := []byte("finalize\n" + dnsmasq.MerlinJffsConfPath + "\t" + hash + "\n")
+	buf := []byte(legacyFinalizePhase + "\n" + legacyEntryPending + "\t" + dnsmasq.MerlinJffsConfPath + "\t" + hash + "\n")
 	if _, err := parseLegacyCleanupJournal(buf); err == nil {
 		t.Fatal("expected finalize journal with entries to be rejected")
+	}
+}
+
+func Test_parseLegacyCleanupJournalRejectsUnknownEntryState(t *testing.T) {
+	hash := merlinSnapshotHash([]byte("x"))
+	buf := []byte(legacyCleanupPhase + "\nsurprise\t" + dnsmasq.MerlinJffsConfPath + "\t" + hash + "\n")
+	if _, err := parseLegacyCleanupJournal(buf); err == nil {
+		t.Fatal("expected unknown legacy entry state to be rejected")
 	}
 }
 
