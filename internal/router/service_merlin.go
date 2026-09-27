@@ -108,7 +108,10 @@ func RefreshMerlinStartupScriptFromRunningBinary() error {
 	if err != nil {
 		return err
 	}
+	return refreshMerlinStartupScriptForExecutable(exePath)
+}
 
+func refreshMerlinStartupScriptForExecutable(exePath string) error {
 	s := &merlinSvc{
 		Config: &service.Config{
 			Name:       "ctrld",
