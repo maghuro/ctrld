@@ -64,17 +64,17 @@ func (m *Merlin) PreRun() error {
 	if err := ntp.WaitNvram(); err != nil {
 		return err
 	}
-	// Wait until directories mounted.
+	// Wait until directories mounted, but never block router startup forever.
 	for _, dir := range []string{"/tmp", "/proc"} {
-		waitDirExists(dir)
-	}
-	// Wait dnsmasq started.
-	for {
-		out, _ := exec.Command("pidof", "dnsmasq").CombinedOutput()
-		if len(bytes.TrimSpace(out)) > 0 {
-			break
+		if err := waitDirExists(dir, 60*time.Second); err != nil {
+			return err
 		}
-		time.Sleep(time.Second)
+	}
+	// dnsmasq should be available during normal Merlin boot. A bounded wait
+	// keeps a broken/missing dnsmasq from wedging ctrld's one-shot startup
+	// indefinitely.
+	if err := waitProcess("dnsmasq", 60*time.Second); err != nil {
+		return err
 	}
 	return nil
 }
@@ -255,12 +255,56 @@ func merlinParsePostConf(buf []byte) []byte {
 	return buf
 }
 
-// waitDirExists waits until the specified directory exists, polling its existence every second.
-func waitDirExists(dir string) {
+func waitUntil(timeout, interval time.Duration, probe func() (bool, error)) error {
+	deadline := time.Now().Add(timeout)
 	for {
-		if _, err := os.Stat(dir); !os.IsNotExist(err) {
-			return
+		ready, err := probe()
+		if err != nil {
+			return err
 		}
-		time.Sleep(time.Second)
+		if ready {
+			return nil
+		}
+		if !time.Now().Before(deadline) {
+			return fmt.Errorf("timed out after %s", timeout)
+		}
+		time.Sleep(interval)
 	}
+}
+
+// waitDirExists waits for a required path without allowing an infinite boot
+// hang if the mount/path never becomes available.
+func waitDirExists(dir string, timeout time.Duration) error {
+	if err := waitUntil(timeout, time.Second, func() (bool, error) {
+		_, err := os.Stat(dir)
+		if err == nil {
+			return true, nil
+		}
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}); err != nil {
+		return fmt.Errorf("wait for %s: %w", dir, err)
+	}
+	return nil
+}
+
+// waitProcess waits for pidof to report a process. pidof's normal "not found"
+// exit status is treated as "not ready yet"; an absent pidof binary is a real
+// platform error.
+func waitProcess(name string, timeout time.Duration) error {
+	if err := waitUntil(timeout, time.Second, func() (bool, error) {
+		out, err := exec.Command("pidof", name).CombinedOutput()
+		if err == nil {
+			return len(bytes.TrimSpace(out)) > 0, nil
+		}
+		if _, ok := err.(*exec.ExitError); ok {
+			return false, nil
+		}
+		return false, err
+	}); err != nil {
+		return fmt.Errorf("wait for process %s: %w", name, err)
+	}
+	return nil
 }
