@@ -194,24 +194,6 @@ func validateMerlinSharedHookPath(path string, requireExecutable bool) (exists b
 	return true, nil
 }
 
-func readMerlinStartupScript(path string) (data []byte, exists bool, err error) {
-	info, err := os.Lstat(path)
-	if os.IsNotExist(err) {
-		return nil, false, nil
-	}
-	if err != nil {
-		return nil, false, err
-	}
-	if !info.Mode().IsRegular() {
-		return nil, true, fmt.Errorf("startup script is not a regular file: %s", path)
-	}
-	buf, err := os.ReadFile(path)
-	if err != nil {
-		return nil, true, err
-	}
-	return buf, true, nil
-}
-
 func (s *merlinSvc) Install() error {
 	exePath, err := os.Executable()
 	if err != nil {
@@ -245,23 +227,11 @@ func (s *merlinSvc) Install() error {
 		return fmt.Errorf("s.template.Execute: %w", err)
 	}
 	startupPublished := false
-	existing, startupExists, err := readMerlinStartupScript(confPath)
+	startupExists, err := prepareExistingMerlinStartupScript(confPath, rendered.Bytes())
 	if err != nil {
-		return fmt.Errorf("read existing startup script: %w", err)
+		return fmt.Errorf("prepare existing startup script: %w", err)
 	}
-	if startupExists {
-		// ctrld.startup is private to ctrld. readMerlinStartupScript uses Lstat,
-		// so this resumable path never follows a pre-existing symlink.
-		if !bytes.Equal(existing, rendered.Bytes()) {
-			return fmt.Errorf("already installed with different startup script: %s", confPath)
-		}
-		// An interrupted previous install may have published the private startup
-		// script before adding both shared hooks. Identical bytes prove that this
-		// install can safely resume instead of getting stuck on "already installed".
-		if err := os.Chmod(confPath, 0755); err != nil {
-			return fmt.Errorf("os.Chmod: startup script: %w", err)
-		}
-	} else {
+	if !startupExists {
 		startupPublished, err = writeMerlinStartupScript(confPath, rendered.Bytes(), 0755)
 		if err != nil {
 			if startupPublished {
