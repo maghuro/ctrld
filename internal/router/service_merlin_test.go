@@ -444,6 +444,40 @@ func TestRefreshMerlinStartupScriptRecoversInstalledLegacyArguments(t *testing.T
 	}
 }
 
+func TestRefreshMerlinStartupScriptForExecutableMigratesFromNewBinaryPath(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Merlin startup scripts are Linux-specific")
+	}
+	dir := t.TempDir()
+	exe := filepath.Join(dir, "ctrld")
+	installedSvc := &merlinSvc{Config: &service.Config{
+		Name:       "ctrld",
+		Executable: exe,
+		Arguments:  []string{"run", "--cd=upgrade-device", "--config=/jffs/controld/ctrld.toml"},
+	}}
+	current, legacy, err := installedSvc.renderStartupScripts(exe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(exe+".startup", legacy, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// This models the first process started from the just-downloaded binary:
+	// it has only its executable path, not the old process's service.Config.
+	if err := refreshMerlinStartupScriptForExecutable(exe); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := os.ReadFile(exe + ".startup")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, current) {
+		t.Fatalf("new-binary migration mismatch\nwant:\n%s\ngot:\n%s", current, got)
+	}
+}
+
 func TestRefreshMerlinStartupScriptLeavesCurrentMarkedScriptUntouched(t *testing.T) {
 	dir := t.TempDir()
 	exe := filepath.Join(dir, "ctrld")
