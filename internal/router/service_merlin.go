@@ -332,9 +332,18 @@ case "$1" in
       $cmd &
       echo $! > "$pid_file"
       chmod 600 "$pid_file"
-      if ! is_running; then
-       logger -c "Failed to start $name"
-       exit 1
+      started=0
+      for _ in 1 2 3 4 5; do
+        if is_running; then
+          started=1
+          break
+        fi
+        sleep 1
+      done
+      if [ "$started" -ne 1 ]; then
+        logger -c "Failed to start $name"
+        rm -f "$pid_file"
+        exit 1
       fi
     fi
   ;;
