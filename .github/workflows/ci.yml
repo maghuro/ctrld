@@ -12,14 +12,14 @@ jobs:
         go: ["1.24.x"]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 1
-      - uses: WillAbides/setup-go-faster@v1.8.0
+      - uses: actions/setup-go@v7
         with:
           go-version: ${{ matrix.go }}
       - run: "go test -race ./..."
-      - uses: dominikh/staticcheck-action@v1.3.1
+      - uses: dominikh/staticcheck-action@v1.4.1
         with:
           version: "2025.1"
           install-go: false
