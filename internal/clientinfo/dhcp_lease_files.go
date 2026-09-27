@@ -1,6 +1,10 @@
 package clientinfo
 
-import "github.com/Control-D-Inc/ctrld"
+import (
+	"sync"
+
+	"github.com/Control-D-Inc/ctrld"
+)
 
 // clientInfoFiles specifies client info files and how to read them on supported platforms.
 var clientInfoFiles = map[string]ctrld.LeaseFileFormat{
@@ -17,4 +21,31 @@ var clientInfoFiles = map[string]ctrld.LeaseFileFormat{
 	"/home/pi/.router/run/dhcp/dnsmasq.leases": ctrld.Dnsmasq,  // Firewalla
 	"/var/lib/kea/dhcp4.leases":                ctrld.KeaDHCP4, // Pfsense
 	"/var/db/dnsmasq.leases":                   ctrld.Dnsmasq,  // OPNsense
+}
+
+
+var clientInfoFilesMu sync.RWMutex
+
+func setClientInfoFile(name string, format ctrld.LeaseFileFormat) {
+	clientInfoFilesMu.Lock()
+	clientInfoFiles[name] = format
+	clientInfoFilesMu.Unlock()
+}
+
+func clientInfoFileFormat(name string) (ctrld.LeaseFileFormat, bool) {
+	clientInfoFilesMu.RLock()
+	format, ok := clientInfoFiles[name]
+	clientInfoFilesMu.RUnlock()
+	return format, ok
+}
+
+func clientInfoFilesSnapshot() map[string]ctrld.LeaseFileFormat {
+	clientInfoFilesMu.RLock()
+	defer clientInfoFilesMu.RUnlock()
+
+	snapshot := make(map[string]ctrld.LeaseFileFormat, len(clientInfoFiles))
+	for name, format := range clientInfoFiles {
+		snapshot[name] = format
+	}
+	return snapshot
 }
