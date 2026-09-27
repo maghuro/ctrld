@@ -305,6 +305,36 @@ func Test_writeMerlinHookUpdatesPreflightsAllPaths(t *testing.T) {
 	}
 }
 
+func Test_writeMerlinHookUpdatesRollsBackPartialWrites(t *testing.T) {
+	firstDir := t.TempDir()
+	secondDir := t.TempDir()
+	first := filepath.Join(firstDir, "dnsmasq.postconf")
+	second := filepath.Join(secondDir, "dnsmasq-sdn.postconf")
+	orig := []byte("#!/bin/sh\necho original\n")
+	if err := os.WriteFile(first, orig, 0750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(second, []byte("#!/bin/sh\necho second\n"), 0750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(secondDir, 0555); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chmod(secondDir, 0755)
+
+	block := []byte("# BEGIN ctrld\necho managed\n# END ctrld")
+	if err := writeMerlinHookUpdates([]string{first, second}, block); err == nil {
+		t.Fatal("expected second write failure")
+	}
+	got, err := os.ReadFile(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, orig) {
+		t.Fatalf("first hook was not rolled back:\nwant: %q\ngot:  %q", orig, got)
+	}
+}
+
 func Test_atomicWriteFilePreservesExistingMode(t *testing.T) {
 	for _, mode := range []os.FileMode{0700, 0770} {
 		t.Run(mode.String(), func(t *testing.T) {
