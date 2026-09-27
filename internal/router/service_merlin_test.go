@@ -66,3 +66,17 @@ func TestMerlinServiceTemplateRendersExecutableIdentity(t *testing.T) {
 		}
 	}
 }
+
+
+func TestMerlinServiceStartWaitsForChildExec(t *testing.T) {
+	for _, want := range []string{
+		"for _ in 1 2 3 4 5; do",
+		"if is_running; then",
+		"sleep 1",
+		`[ "$started" -ne 1 ]`,
+	} {
+		if !strings.Contains(merlinSvcScript, want) {
+			t.Fatalf("Merlin service start is missing exec-wait safeguard %q", want)
+		}
+	}
+}
