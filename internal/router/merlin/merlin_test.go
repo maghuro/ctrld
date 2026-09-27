@@ -146,25 +146,22 @@ func Test_cleanupDnsmasqPostconfPreservesPreexistingStub(t *testing.T) {
 	}
 }
 
-func Test_cleanupDnsmasqPostconfRemovesCtrldCreatedStub(t *testing.T) {
+func Test_cleanupDnsmasqPostconfLeavesStubWhenCtrldCreatedHook(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "dnsmasq.postconf")
 	block := []byte("# BEGIN ctrld\necho managed\n# END ctrld")
 	if err := os.WriteFile(path, merlinUpsertPostConf(nil, block), 0750); err != nil {
-		t.Fatal(err)
-	}
-	marker := merlinPostConfCreatedMarker(path)
-	if err := os.WriteFile(marker, []byte("created\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
 
 	if err := cleanupDnsmasqPostconf(path); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(path); !os.IsNotExist(err) {
-		t.Fatalf("ctrld-created hook still exists: %v", err)
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("cleanup removed shared hook path: %v", err)
 	}
-	if _, err := os.Stat(marker); !os.IsNotExist(err) {
-		t.Fatalf("ctrld-created marker still exists: %v", err)
+	if string(got) != "#!/bin/sh" {
+		t.Fatalf("unexpected cleaned stub: %q", got)
 	}
 }
 
