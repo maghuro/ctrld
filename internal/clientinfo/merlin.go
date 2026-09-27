@@ -54,6 +54,10 @@ func (m *merlinDiscover) LookupHostnameByMac(mac string) string {
 //   - Empty parts[0]               => skip empty hostname
 //   - Empty parts[1]               => skip empty MAC
 func (m *merlinDiscover) parseMerlinCustomClientList(data string) {
+	// custom_clientlist is a complete snapshot, not a delta. Drop entries from
+	// the previous refresh so removed/renamed clients cannot remain cached.
+	m.hostname.Clear()
+
 	entries := strings.Split(data, "<")
 	for _, entry := range entries {
 		parts := strings.SplitN(string(entry), ">", 3)
