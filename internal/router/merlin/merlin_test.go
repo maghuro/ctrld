@@ -339,6 +339,58 @@ func Test_writeMerlinHookUpdatesRollsBackPartialWrites(t *testing.T) {
 	}
 }
 
+func Test_revalidateMerlinHookUpdateDetectsContentChange(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "dnsmasq.postconf")
+	orig := []byte("#!/bin/sh\necho original\n")
+	if err := os.WriteFile(path, orig, 0750); err != nil {
+		t.Fatal(err)
+	}
+	block := []byte("# BEGIN ctrld\necho managed\n# END ctrld")
+	update, err := prepareMerlinHookUpdate(path, block)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("#!/bin/sh\necho changed\n"), 0750); err != nil {
+		t.Fatal(err)
+	}
+	if err := revalidateMerlinHookUpdate(update); err == nil {
+		t.Fatal("expected revalidation failure after content change")
+	}
+}
+
+func Test_revalidateMerlinHookUpdateDetectsAppearedPath(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "dnsmasq.postconf")
+	block := []byte("# BEGIN ctrld\necho managed\n# END ctrld")
+	update, err := prepareMerlinHookUpdate(path, block)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("#!/bin/sh\necho addon\n"), 0750); err != nil {
+		t.Fatal(err)
+	}
+	if err := revalidateMerlinHookUpdate(update); err == nil {
+		t.Fatal("expected revalidation failure when a missing hook appears")
+	}
+}
+
+func Test_revalidateMerlinHookUpdateDetectsDisappearedPath(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "dnsmasq.postconf")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\n"), 0750); err != nil {
+		t.Fatal(err)
+	}
+	block := []byte("# BEGIN ctrld\necho managed\n# END ctrld")
+	update, err := prepareMerlinHookUpdate(path, block)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := revalidateMerlinHookUpdate(update); err == nil {
+		t.Fatal("expected revalidation failure when a hook disappears")
+	}
+}
+
 func Test_atomicWriteFilePreservesExistingMode(t *testing.T) {
 	for _, mode := range []os.FileMode{0700, 0770} {
 		t.Run(mode.String(), func(t *testing.T) {
