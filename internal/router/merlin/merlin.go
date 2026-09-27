@@ -2,7 +2,6 @@ package merlin
 
 import (
 	"bytes"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -549,39 +548,33 @@ func (m *Merlin) setupMainDnsmasqFallback() error {
 	// Publish without replacement semantics. Between the earlier ownership
 	// check and this point an administrator/addon may legitimately create a new
 	// dnsmasq.conf; ctrld must never clobber that concurrently-created file.
-	if err := writeFileNoReplace(dnsmasq.MerlinJffsConfPath, built, 0644); err != nil {
-		current, readErr := os.ReadFile(dnsmasq.MerlinJffsConfPath)
-		switch {
-		case readErr == nil && merlinSnapshotHash(current) == hash:
-			// Rename reached the target. Keep the already-durable ownership marker
-			// so deferred/retry cleanup can safely remove the visible fallback.
-			return fmt.Errorf("publish ctrld dnsmasq fallback after rename: %w", err)
-		case os.IsNotExist(readErr):
+	published, err := writeFileNoReplace(dnsmasq.MerlinJffsConfPath, built, 0644)
+	if err != nil {
+		if !published {
+			// No link to the target was created by ctrld. Even if another actor
+			// concurrently created byte-identical content, ctrld must not infer
+			// ownership from bytes alone.
 			if removeErr := removeFileDurable(merlinSnapshotStatePath); removeErr != nil {
 				return fmt.Errorf("publish ctrld dnsmasq fallback: %w; remove ownership state: %v", err, removeErr)
 			}
-			return fmt.Errorf("publish ctrld dnsmasq fallback: %w", err)
-		case readErr == nil:
-			// A different readable file is present, so ctrld cannot claim it.
-			if removeErr := removeFileDurable(merlinSnapshotStatePath); removeErr != nil {
-				return fmt.Errorf("publish ctrld dnsmasq fallback: %w; unexpected target and ownership cleanup failed: %v", err, removeErr)
-			}
-			return fmt.Errorf("publish ctrld dnsmasq fallback: %w; target content does not match ctrld snapshot", err)
-		default:
-			// Publication state is uncertain. Retain the marker rather than turn
-			// a possibly successful rename into a permanently unowned snapshot.
-			return fmt.Errorf("publish ctrld dnsmasq fallback: %w; verify target: %v", err, readErr)
 		}
+		// If published is true, the no-replace link succeeded and only a
+		// post-publication cleanup/sync step failed. Retain ownership so Cleanup
+		// can reconcile the exact published snapshot safely.
+		return fmt.Errorf("publish ctrld dnsmasq fallback: %w", err)
 	}
 	return nil
 }
 
-func writeFileNoReplace(target string, data []byte, mode os.FileMode) error {
+// writeFileNoReplace publishes target only if it does not already exist.
+// published reports whether ctrld's inode was successfully linked at target;
+// callers must not infer ownership from target contents when published is false.
+func writeFileNoReplace(target string, data []byte, mode os.FileMode) (published bool, err error) {
 	dir := filepath.Dir(target)
 	base := filepath.Base(target)
 	tmp, err := os.CreateTemp(dir, "."+base+".ctrld-noreplace-*")
 	if err != nil {
-		return err
+		return false, err
 	}
 	tmpPath := tmp.Name()
 	cleanup := true
@@ -593,31 +586,35 @@ func writeFileNoReplace(target string, data []byte, mode os.FileMode) error {
 	}()
 
 	if err := tmp.Chmod(mode); err != nil {
-		return err
+		return false, err
 	}
 	if _, err := tmp.Write(data); err != nil {
-		return err
+		return false, err
 	}
 	if err := tmp.Sync(); err != nil {
-		return err
+		return false, err
 	}
 	if err := tmp.Close(); err != nil {
-		return err
+		return false, err
 	}
 
 	// link(2) is atomic with respect to target existence and never replaces an
 	// existing pathname. The temporary file lives in the same directory/filesystem.
 	if err := os.Link(tmpPath, target); err != nil {
-		return err
+		return false, err
 	}
+	published = true
 	if err := os.Remove(tmpPath); err != nil {
-		// The target is already published and valid; retain normal publication
-		// semantics but report cleanup failure to the caller for reconciliation.
+		// The target is already published and valid; report the failure with
+		// published=true so the caller retains ownership state.
 		cleanup = false
-		return err
+		return true, err
 	}
 	cleanup = false
-	return syncParentDir(dir)
+	if err := syncParentDir(dir); err != nil {
+		return true, err
+	}
+	return true, nil
 }
 
 func (m *Merlin) buildMainDnsmasqFallback(buf []byte) ([]byte, error) {
@@ -706,23 +703,89 @@ func cleanupOwnedMainSnapshot() error {
 		return nil
 	}
 
-	buf, err := os.ReadFile(dnsmasq.MerlinJffsConfPath)
-	if os.IsNotExist(err) {
-		return removeFileDurable(merlinSnapshotStatePath)
-	}
+	removed, err := quarantineRemoveOwnedFile(dnsmasq.MerlinJffsConfPath, expected)
 	if err != nil {
 		return err
 	}
-	if merlinSnapshotHash(buf) != expected {
-		return fmt.Errorf("refusing to remove modified Merlin dnsmasq fallback: %s", dnsmasq.MerlinJffsConfPath)
+	if !removed {
+		// No target exists. The marker is orphaned and can be removed.
+		return removeFileDurable(merlinSnapshotStatePath)
 	}
-	if err := removeFileDurable(dnsmasq.MerlinJffsConfPath); err != nil {
-		return err
+	return removeFileDurable(merlinSnapshotStatePath)
+}
+
+// quarantineRemoveOwnedFile atomically moves path out of the public pathname,
+// then verifies the captured file before deleting it. This binds deletion to
+// the exact inode that was renamed, rather than to a pathname that another
+// addon/user could replace between a hash check and unlink.
+//
+// If the captured file is not ctrld-owned, it is restored with no-clobber
+// semantics. If another actor recreates path before restoration, both files are
+// preserved and an error identifies the quarantine location for recovery.
+func quarantineRemoveOwnedFile(path, expectedHash string) (bool, error) {
+	dir := filepath.Dir(path)
+	base := filepath.Base(path)
+	quarantineDir, err := os.MkdirTemp(dir, "."+base+".ctrld-quarantine-*")
+	if err != nil {
+		return false, err
 	}
-	if err := removeFileDurable(merlinSnapshotStatePath); err != nil {
-		return err
+	quarantine := filepath.Join(quarantineDir, "snapshot")
+	cleanupDir := true
+	defer func() {
+		if cleanupDir {
+			_ = os.Remove(quarantineDir)
+		}
+	}()
+
+	if err := os.Rename(path, quarantine); err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
 	}
-	return nil
+
+	buf, err := os.ReadFile(quarantine)
+	if err != nil {
+		cleanupDir = false
+		return true, fmt.Errorf("read quarantined Merlin fallback %s: %w", quarantine, err)
+	}
+	if merlinSnapshotHash(buf) != expectedHash {
+		// Restore only if nobody recreated the public pathname in the meantime.
+		if err := os.Link(quarantine, path); err != nil {
+			cleanupDir = false
+			return true, fmt.Errorf(
+				"refusing to remove modified Merlin dnsmasq fallback; preserved captured file at %s and could not restore %s: %w",
+				quarantine, path, err,
+			)
+		}
+		if err := os.Remove(quarantine); err != nil {
+			cleanupDir = false
+			return true, fmt.Errorf("restored modified Merlin fallback but could not remove quarantine %s: %w", quarantine, err)
+		}
+		if err := os.Remove(quarantineDir); err != nil {
+			cleanupDir = false
+			return true, err
+		}
+		cleanupDir = false
+		if err := syncParentDir(dir); err != nil {
+			return true, err
+		}
+		return true, fmt.Errorf("refusing to remove modified Merlin dnsmasq fallback: %s", path)
+	}
+
+	if err := os.Remove(quarantine); err != nil {
+		cleanupDir = false
+		return true, fmt.Errorf("remove quarantined ctrld fallback %s: %w", quarantine, err)
+	}
+	if err := os.Remove(quarantineDir); err != nil {
+		cleanupDir = false
+		return true, err
+	}
+	cleanupDir = false
+	if err := syncParentDir(dir); err != nil {
+		return true, err
+	}
+	return true, nil
 }
 
 // cleanupDnsmasqJffs removes the JFFS configuration file specified in the given dnsmasqConfig, if it exists.
