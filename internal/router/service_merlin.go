@@ -627,27 +627,34 @@ func merlinServiceStatus(out []byte, cmdErr error) (service.Status, error) {
 }
 
 func (s *merlinSvc) Start() error {
-	return withMerlinServiceLock(func() error {
-		// Upgrades replace only the binary before restarting the service. Refresh
-		// an exact ctrld-owned legacy startup script here so lifecycle/security
-		// fixes reach existing installations without requiring a reinstall.
-		if err := s.refreshMerlinStartupScript(); err != nil {
-			return err
-		}
-		return exec.Command(s.configPath(), "start").Run()
-	})
+	return withMerlinServiceLock(s.startLocked)
+}
+
+func (s *merlinSvc) startLocked() error {
+	// Upgrades replace only the binary before restarting the service. Refresh
+	// an exact ctrld-owned legacy startup script here as a secondary path; the
+	// newly launched binary also performs this migration from ctrld run.
+	if err := s.refreshMerlinStartupScript(); err != nil {
+		return err
+	}
+	return exec.Command(s.configPath(), "start").Run()
 }
 
 func (s *merlinSvc) Stop() error {
+	return withMerlinServiceLock(s.stopLocked)
+}
+
+func (s *merlinSvc) stopLocked() error {
 	return exec.Command(s.configPath(), "stop").Run()
 }
 
 func (s *merlinSvc) Restart() error {
-	err := s.Stop()
-	if err != nil {
-		return err
-	}
-	return s.Start()
+	return withMerlinServiceLock(func() error {
+		if err := s.stopLocked(); err != nil {
+			return err
+		}
+		return s.startLocked()
+	})
 }
 
 const merlinLegacySvcScript = `#!/bin/sh
