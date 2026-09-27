@@ -280,7 +280,7 @@ func TestPrepareExistingMerlinStartupScriptRejectsSymlink(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if exists, err := prepareExistingMerlinStartupScript(link, []byte("private\n")); err == nil || !exists {
+	if exists, err := prepareExistingMerlinStartupScript(link, []byte("private\n"), nil); err == nil || !exists {
 		t.Fatalf("symlink startup script = (exists %v, err %v), want exists=true and error", exists, err)
 	}
 	got, err := os.ReadFile(target)
@@ -298,7 +298,7 @@ func TestPrepareExistingMerlinStartupScriptRegularFile(t *testing.T) {
 	if err := os.WriteFile(path, want, 0600); err != nil {
 		t.Fatal(err)
 	}
-	exists, err := prepareExistingMerlinStartupScript(path, want)
+	exists, err := prepareExistingMerlinStartupScript(path, want, want)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -325,11 +325,73 @@ func TestPrepareExistingMerlinStartupScriptRegularFile(t *testing.T) {
 
 func TestPrepareExistingMerlinStartupScriptMissing(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "ctrld.startup")
-	exists, err := prepareExistingMerlinStartupScript(path, []byte("#!/bin/sh\n"))
+	exists, err := prepareExistingMerlinStartupScript(path, []byte("#!/bin/sh\n"), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if exists {
 		t.Fatal("missing startup script reported as existing")
+	}
+}
+
+
+func TestPrepareExistingMerlinStartupScriptMigratesExactLegacyTemplate(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Merlin startup scripts are Linux-specific")
+	}
+	s := &merlinSvc{
+		Config: &service.Config{
+			Name:       "ctrld",
+			Executable: "/jffs/controld/ctrld",
+			Arguments:  []string{"run", "--cd", "example"},
+		},
+	}
+	current, legacy, err := s.renderStartupScripts(s.Config.Executable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(current, legacy) {
+		t.Fatal("current and legacy templates unexpectedly match")
+	}
+
+	path := filepath.Join(t.TempDir(), "ctrld.startup")
+	if err := os.WriteFile(path, legacy, 0755); err != nil {
+		t.Fatal(err)
+	}
+	exists, err := prepareExistingMerlinStartupScript(path, current, legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !exists {
+		t.Fatal("legacy startup script reported missing")
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, current) {
+		t.Fatalf("legacy startup script was not migrated exactly")
+	}
+}
+
+func TestPrepareExistingMerlinStartupScriptRejectsUnknownCustomization(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ctrld.startup")
+	custom := []byte("#!/bin/sh\necho user-custom\n")
+	if err := os.WriteFile(path, custom, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if exists, err := prepareExistingMerlinStartupScript(
+		path,
+		[]byte("#!/bin/sh\necho current\n"),
+		[]byte("#!/bin/sh\necho legacy\n"),
+	); err == nil || !exists {
+		t.Fatalf("custom startup script = (exists %v, err %v), want exists=true and error", exists, err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, custom) {
+		t.Fatalf("custom startup script was modified: got %q want %q", got, custom)
 	}
 }
