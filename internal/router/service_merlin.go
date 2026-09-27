@@ -134,28 +134,39 @@ func (s *merlinSvc) Install() error {
 			return fmt.Errorf("os.Chmod: jffs script: %w", err)
 		}
 
-		if err := exec.Command("sh", tmpScript.Name(), line, script).Run(); err != nil {
+		if err := exec.Command("sh", tmpScript.Name(), line, script, "add").Run(); err != nil {
 			return fmt.Errorf("exec.Command: add startup script: %w", err)
 		}
 		return nil
 	}
 
-	for script, line := range map[string]string{
-		merlinJFFSScriptPath:             s.configPath() + " start",
-		merlinJFFSServiceEventScriptPath: s.configPath() + ` service_event "$1" "$2"`,
-	} {
-		if err := addLineToScript(line, script); err != nil {
+	type hookLine struct {
+		script string
+		line   string
+	}
+	hooks := []hookLine{
+		{merlinJFFSScriptPath, s.configPath() + " start"},
+		{merlinJFFSServiceEventScriptPath, s.configPath() + ` service_event "$1" "$2"`},
+	}
+	installed := make([]hookLine, 0, len(hooks))
+	for _, hook := range hooks {
+		if err := addLineToScript(hook.line, hook.script); err != nil {
+			// Best-effort rollback: remove only lines successfully installed by
+			// this attempt, then remove the startup script so a retry can start
+			// from a clean state.
+			for i := len(installed) - 1; i >= 0; i-- {
+				_ = exec.Command("sh", tmpScript.Name(), installed[i].line, installed[i].script, "remove").Run()
+			}
+			_ = os.Remove(confPath)
 			return err
 		}
+		installed = append(installed, hook)
 	}
 
 	return nil
 }
 
 func (s *merlinSvc) Uninstall() error {
-	if err := os.Remove(s.configPath()); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("os.Remove: %w", err)
-	}
 	tmpScript, err := os.CreateTemp("", "ctrld_uninstall")
 	if err != nil {
 		return fmt.Errorf("os.CreateTemp: %w", err)
@@ -178,7 +189,7 @@ func (s *merlinSvc) Uninstall() error {
 			return err
 		}
 
-		if err := exec.Command("sh", tmpScript.Name(), line, script).Run(); err != nil {
+		if err := exec.Command("sh", tmpScript.Name(), line, script, "remove").Run(); err != nil {
 			return fmt.Errorf("exec.Command: remove startup script: %w", err)
 		}
 		return nil
@@ -193,6 +204,11 @@ func (s *merlinSvc) Uninstall() error {
 		}
 	}
 
+	// Remove ctrld's private startup script only after all shared hook
+	// references have been removed successfully.
+	if err := os.Remove(s.configPath()); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("os.Remove: %w", err)
+	}
 	return nil
 }
 
@@ -356,11 +372,12 @@ const merlinAddLineToScript = `#!/bin/sh
 
 line=$1
 file=$2
+mode=$3
 
 . /usr/sbin/helper.sh
 
 pc_delete "$line" "$file"
-pc_append "$line" "$file"
+[ "$mode" = "remove" ] || pc_append "$line" "$file"
 `
 
 const merlinRemoveLineFromScript = `#!/bin/sh
