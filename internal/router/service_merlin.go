@@ -137,6 +137,44 @@ func syncMerlinServiceDir(dir string) error {
 	return f.Sync()
 }
 
+func createMerlinSharedHookStub(path string) (retErr error) {
+	stub, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if err != nil {
+		return err
+	}
+	closed := false
+	defer func() {
+		if !closed {
+			_ = stub.Close()
+		}
+		if retErr != nil {
+			_ = os.Remove(path)
+			_ = syncMerlinServiceDir(filepath.Dir(path))
+		}
+	}()
+
+	// OpenFile creation mode is filtered through the process umask. Merlin must
+	// execute services-start/service-event at boot, so set the final mode
+	// explicitly on the already-open inode before making it durable.
+	if err := stub.Chmod(0755); err != nil {
+		return err
+	}
+	if _, err := stub.Write([]byte("#!/bin/sh\n")); err != nil {
+		return err
+	}
+	if err := stub.Sync(); err != nil {
+		return err
+	}
+	if err := stub.Close(); err != nil {
+		return err
+	}
+	closed = true
+	if err := syncMerlinServiceDir(filepath.Dir(path)); err != nil {
+		return err
+	}
+	return nil
+}
+
 func validateMerlinSharedHookPath(path string, requireExecutable bool) (exists bool, err error) {
 	info, err := os.Lstat(path)
 	if os.IsNotExist(err) {
@@ -262,39 +300,15 @@ func (s *merlinSvc) Install() error {
 
 			// Create a missing shared hook without following a raced symlink or
 			// truncating a file another addon created after our Lstat.
-			stub, err := os.OpenFile(script, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0755)
-			if os.IsExist(err) {
-				// Another actor won the race. Re-run Lstat validation against
-				// the now-existing path before deciding whether it is safe.
-				continue
-			}
-			if err != nil {
+			if err := createMerlinSharedHookStub(script); err != nil {
+				if os.IsExist(err) {
+					// Another actor won the race. Re-run Lstat validation against
+					// the now-existing path before deciding whether it is safe.
+					continue
+				}
 				return false, false, err
 			}
 			created = true
-			stubData := []byte("#!/bin/sh\n")
-			if _, err := stub.Write(stubData); err != nil {
-				_ = stub.Close()
-				_ = os.Remove(script)
-				_ = syncMerlinServiceDir(filepath.Dir(script))
-				return false, false, err
-			}
-			if err := stub.Sync(); err != nil {
-				_ = stub.Close()
-				_ = os.Remove(script)
-				_ = syncMerlinServiceDir(filepath.Dir(script))
-				return false, false, err
-			}
-			if err := stub.Close(); err != nil {
-				_ = os.Remove(script)
-				_ = syncMerlinServiceDir(filepath.Dir(script))
-				return false, false, err
-			}
-			if err := syncMerlinServiceDir(filepath.Dir(script)); err != nil {
-				_ = os.Remove(script)
-				_ = syncMerlinServiceDir(filepath.Dir(script))
-				return false, false, err
-			}
 			break
 		}
 		defer func() {
