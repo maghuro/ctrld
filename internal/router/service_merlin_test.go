@@ -15,7 +15,7 @@ func TestMerlinServiceScriptValidatesPidOwnership(t *testing.T) {
 	for _, want := range []string{
 		`case "$pid" in`,
 		`[ -r "/proc/$pid/cmdline" ]`,
-		`tr '\\000' ' '`,
+		`tr '\000' ' '`,
 		`"$exe"|"$exe "*`,
 	} {
 		if !strings.Contains(merlinSvcScript, want) {
