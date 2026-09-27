@@ -259,15 +259,27 @@ func (s *merlinSvc) Restart() error {
 const merlinSvcScript = `#!/bin/sh
 
 name="{{.Name}}"
+exe="{{.Path}}"
 cmd="{{.Path}}{{range .Arguments}} {{.}}{{end}}"
 pid_file="/tmp/$name.pid"
 
 get_pid() {
-  cat "$pid_file"
+  [ -r "$pid_file" ] || return 1
+  pid="$(cat "$pid_file" 2>/dev/null)" || return 1
+  case "$pid" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  printf '%s\n' "$pid"
 }
 
 is_running() {
-  [ -f "$pid_file" ] && ps | grep -q "^ *$(get_pid) "
+  pid="$(get_pid)" || return 1
+  [ -r "/proc/$pid/cmdline" ] || return 1
+  process_cmd="$(tr '\000' ' ' < "/proc/$pid/cmdline" 2>/dev/null)" || return 1
+  case "$process_cmd" in
+    "$exe"|"$exe "*) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 case "$1" in
@@ -275,6 +287,7 @@ case "$1" in
     if is_running; then
       logger -c "Already started"
     else
+      rm -f "$pid_file"
       logger -c "Starting $name"
       if [ -f /rom/ca-bundle.crt ]; then
         # For John’s fork
@@ -307,11 +320,12 @@ case "$1" in
       logger -c "failed to stop $name"
       exit 1
     fi
+    rm -f "$pid_file"
     exit 0
   ;;
   restart)
-    $0 stop
-    $0 start
+    "$0" stop || exit $?
+    "$0" start
   ;;
   status)
     if is_running; then
