@@ -511,8 +511,12 @@ mode=$3
 
 . /usr/sbin/helper.sh
 
-pc_delete "$line" "$file"
-[ "$mode" = "remove" ] || pc_append "$line" "$file"
+if [ "$mode" = "remove" ]; then
+  pattern=$(_quote "$line")
+  sed -i "/^$pattern$/d" "$file"
+else
+  grep -qxF "$line" "$file" || pc_append "$line" "$file"
+fi
 `
 
 const merlinRemoveLineFromScript = `#!/bin/sh
@@ -522,5 +526,6 @@ file=$2
 
 . /usr/sbin/helper.sh
 
-pc_delete "$line" "$file" 
+pattern=$(_quote "$line")
+sed -i "/^$pattern$/d" "$file"
 `
