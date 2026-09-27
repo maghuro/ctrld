@@ -79,7 +79,7 @@ func (m *Merlin) PreRun() error {
 }
 
 // Setup initializes and configures the Merlin instance for use, including setting up dnsmasq and necessary nvram settings.
-func (m *Merlin) Setup() error {
+func (m *Merlin) Setup() (retErr error) {
 	if m.cfg.FirstListener().IsDirectDnsListener() {
 		return nil
 	}
@@ -87,6 +87,24 @@ func (m *Merlin) Setup() error {
 	if val, _ := nvram.Run("get", nvram.CtrldSetupKey); val == "1" {
 		return nil
 	}
+
+	// Publish the existing ctrld_setup transaction marker before touching shared
+	// hooks or persistent dnsmasq snapshots. Any later setup failure can then use
+	// the normal Cleanup path instead of leaving an untracked partial install.
+	//
+	// This also ensures dnspriv_enable is already in ctrld's desired state when
+	// Merlin regenerates dnsmasq during restart.
+	if err := nvram.SetKV(nvramKvMap, nvram.CtrldSetupKey); err != nil {
+		return err
+	}
+	defer func() {
+		if retErr == nil {
+			return
+		}
+		if cleanupErr := m.Cleanup(); cleanupErr != nil {
+			retErr = fmt.Errorf("%v; setup rollback failed: %w", retErr, cleanupErr)
+		}
+	}()
 
 	if err := m.writeDnsmasqPostconf(); err != nil {
 		return err
@@ -100,10 +118,6 @@ func (m *Merlin) Setup() error {
 
 	// Restart dnsmasq service.
 	if err := restartDNSMasq(); err != nil {
-		return err
-	}
-
-	if err := nvram.SetKV(nvramKvMap, nvram.CtrldSetupKey); err != nil {
 		return err
 	}
 
@@ -198,10 +212,12 @@ func (m *Merlin) cleanupDnsmasqJffs(cfg *dnsmasqConfig) error {
 // merlinHookUpdate is prepared entirely before any shared hook is modified.
 // This lets us validate/read both Merlin hook paths before the first write.
 type merlinHookUpdate struct {
-	path     string
-	data     []byte
-	original []byte
-	existed  bool
+	path          string
+	data          []byte
+	original      []byte
+	existed       bool
+	pathType      os.FileMode
+	symlinkTarget string
 }
 
 // writeDnsmasqPostconf installs ctrld-owned blocks in Merlin's main and SDN
@@ -245,6 +261,12 @@ func writeMerlinHookUpdatesWith(
 
 	written := make([]merlinHookUpdate, 0, len(updates))
 	for _, update := range updates {
+		if err := revalidateMerlinHookUpdate(update); err != nil {
+			if rollbackErr := rollbackMerlinHookUpdates(written); rollbackErr != nil {
+				return fmt.Errorf("revalidate Merlin hook %s: %w; rollback failed: %v", update.path, err, rollbackErr)
+			}
+			return fmt.Errorf("revalidate Merlin hook %s: %w", update.path, err)
+		}
 		if err := writeFile(update.path, update.data, 0750); err != nil {
 			if rollbackErr := rollbackMerlinHookUpdates(written); rollbackErr != nil {
 				return fmt.Errorf("write Merlin hook %s: %w; rollback failed: %v", update.path, err, rollbackErr)
@@ -280,7 +302,7 @@ func rollbackMerlinHookUpdates(updates []merlinHookUpdate) error {
 }
 
 func prepareMerlinHookUpdate(path string, block []byte) (merlinHookUpdate, error) {
-	_, statErr := os.Lstat(path)
+	info, statErr := os.Lstat(path)
 	pathMissing := os.IsNotExist(statErr)
 	if statErr != nil && !pathMissing {
 		return merlinHookUpdate{}, statErr
@@ -294,13 +316,62 @@ func prepareMerlinHookUpdate(path string, block []byte) (merlinHookUpdate, error
 		buf = nil
 	}
 
-	original := append([]byte(nil), buf...)
-	return merlinHookUpdate{
+	update := merlinHookUpdate{
 		path:     path,
 		data:     merlinUpsertPostConf(buf, block),
-		original: original,
+		original: append([]byte(nil), buf...),
 		existed:  !pathMissing,
-	}, nil
+	}
+	if !pathMissing {
+		update.pathType = info.Mode().Type()
+		if info.Mode()&os.ModeSymlink != 0 {
+			target, err := os.Readlink(path)
+			if err != nil {
+				return merlinHookUpdate{}, err
+			}
+			update.symlinkTarget = target
+		}
+	}
+	return update, nil
+}
+
+func revalidateMerlinHookUpdate(update merlinHookUpdate) error {
+	info, err := os.Lstat(update.path)
+	if !update.existed {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("shared hook appeared after preflight")
+	}
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("shared hook disappeared after preflight")
+		}
+		return err
+	}
+	if info.Mode().Type() != update.pathType {
+		return fmt.Errorf("shared hook type changed after preflight")
+	}
+	if update.pathType&os.ModeSymlink != 0 {
+		target, err := os.Readlink(update.path)
+		if err != nil {
+			return err
+		}
+		if target != update.symlinkTarget {
+			return fmt.Errorf("shared hook symlink target changed after preflight")
+		}
+	}
+	current, err := os.ReadFile(update.path)
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(current, update.original) {
+		return fmt.Errorf("shared hook content changed after preflight")
+	}
+	return nil
 }
 
 func cleanupDnsmasqPostconf(path string) error {
