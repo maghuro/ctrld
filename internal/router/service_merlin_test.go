@@ -2,6 +2,7 @@ package router
 
 import (
 	"bytes"
+	"os"
 	"strings"
 	"testing"
 
@@ -78,5 +79,22 @@ func TestMerlinServiceStartWaitsForChildExec(t *testing.T) {
 		if !strings.Contains(merlinSvcScript, want) {
 			t.Fatalf("Merlin service start is missing exec-wait safeguard %q", want)
 		}
+	}
+}
+
+
+func TestMerlinServiceStatusTreatsStoppedAsState(t *testing.T) {
+	status, err := merlinServiceStatus([]byte("stopped\n"), os.ErrProcessDone)
+	if err != nil {
+		t.Fatalf("stopped status returned error: %v", err)
+	}
+	if status != service.StatusStopped {
+		t.Fatalf("status = %v, want %v", status, service.StatusStopped)
+	}
+}
+
+func TestMerlinServiceStatusRejectsUnexpectedOutput(t *testing.T) {
+	if _, err := merlinServiceStatus([]byte("mystery\n"), nil); err == nil {
+		t.Fatal("expected unexpected status output to return an error")
 	}
 }
