@@ -151,11 +151,20 @@ func Restore(m map[string]string, setupKey string) error {
 		return fmt.Errorf("%s: %w", out, err)
 	}
 	if out, err := Run("commit"); err != nil {
-		// Do not persist setupKey=1 after the original values have been restored:
-		// that marker means "ctrld is configured" to other router backends. If
-		// this commit fails, return the error and let the caller retry/reconcile.
-		return fmt.Errorf("%s: %w", out, err)
-
+		// The persistent commit may have failed while the volatile nvram view
+		// already has setupKey unset. Re-arm setupKey only in volatile NVRAM so
+		// Merlin Cleanup will retry Restore in this boot, but deliberately do not
+		// commit the marker: if the restored values actually reached persistent
+		// storage despite the reported error, a reboot must not resurrect a
+		// completed ctrld setup transaction.
+		commitErr := fmt.Errorf("%s: %w", out, err)
+		if markerOut, markerErr := Run("set", setupKey+"=1"); markerErr != nil {
+			return errors.Join(
+				commitErr,
+				fmt.Errorf("failed to re-arm volatile %s after restore commit failure: %s: %w", setupKey, markerOut, markerErr),
+			)
+		}
+		return commitErr
 	}
 	return nil
 }
