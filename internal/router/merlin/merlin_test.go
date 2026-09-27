@@ -603,93 +603,86 @@ func Test_cleanupPreparationRevalidatesBeforeWrite(t *testing.T) {
 
 
 
-func Test_writeFileNoReplaceRefusesExistingTarget(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "dnsmasq.conf")
-	original := []byte("user-owned\n")
-	if err := os.WriteFile(path, original, 0644); err != nil {
-		t.Fatal(err)
+func Test_mainSnapshotStateRoundTrip(t *testing.T) {
+	want := mainSnapshotState{
+		phase: snapshotPhaseQuarantine,
+		hash:  merlinSnapshotHash([]byte("owned snapshot")),
 	}
-
-	published, err := writeFileNoReplace(path, []byte("ctrld-owned\n"), 0644)
-	if err == nil {
-		t.Fatal("expected no-replace publication to fail when target already exists")
-	}
-	if published {
-		t.Fatal("existing-target conflict must report published=false")
-	}
-	got, err := os.ReadFile(path)
+	buf, err := encodeMainSnapshotState(want)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(got, original) {
-		t.Fatalf("existing target was modified:\nwant: %q\ngot:  %q", original, got)
+	got, err := parseMainSnapshotState(buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Fatalf("snapshot state mismatch: want %#v, got %#v", want, got)
 	}
 }
 
-func Test_writeFileNoReplacePublishesAbsentTarget(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "dnsmasq.conf")
-	want := []byte("ctrld-owned\n")
-
-	published, err := writeFileNoReplace(path, want, 0644)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !published {
-		t.Fatal("successful no-replace publication must report published=true")
-	}
-	got, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(got, want) {
-		t.Fatalf("published target mismatch:\nwant: %q\ngot:  %q", want, got)
+func Test_parseMainSnapshotStateRejectsHashOnlyOwnership(t *testing.T) {
+	buf := []byte("sha256=" + merlinSnapshotHash([]byte("legacy")) + "\n")
+	if _, err := parseMainSnapshotState(buf); err == nil {
+		t.Fatal("expected hash-only ownership state to be rejected")
 	}
 }
 
-
-func Test_quarantineRemoveOwnedFileDeletesCapturedOwnedSnapshot(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "dnsmasq.conf")
-	content := []byte("ctrld-owned\n")
-	if err := os.WriteFile(path, content, 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	removed, err := quarantineRemoveOwnedFile(path, merlinSnapshotHash(content))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !removed {
-		t.Fatal("expected an existing owned snapshot to be captured")
-	}
-	if _, err := os.Stat(path); !os.IsNotExist(err) {
-		t.Fatalf("owned snapshot still exists after cleanup: %v", err)
+func Test_parseMainSnapshotStateRejectsUnknownPhase(t *testing.T) {
+	buf := []byte(
+		"snapshot-v2\nphase=surprise\nsha256=" +
+			merlinSnapshotHash([]byte("owned")) + "\n",
+	)
+	if _, err := parseMainSnapshotState(buf); err == nil {
+		t.Fatal("expected unknown snapshot phase to be rejected")
 	}
 }
 
-func Test_quarantineRemoveOwnedFileRestoresModifiedSnapshot(t *testing.T) {
+func Test_sameFilePathsDistinguishesHardLinkFromIdenticalCopy(t *testing.T) {
 	dir := t.TempDir()
-	path := filepath.Join(dir, "dnsmasq.conf")
-	owned := []byte("ctrld-owned\n")
-	modified := []byte("user-modified\n")
-	if err := os.WriteFile(path, modified, 0644); err != nil {
+	original := filepath.Join(dir, "original")
+	hardLink := filepath.Join(dir, "hard-link")
+	copyPath := filepath.Join(dir, "copy")
+	content := []byte("same bytes\n")
+
+	if err := os.WriteFile(original, content, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(original, hardLink); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(copyPath, content, 0644); err != nil {
 		t.Fatal(err)
 	}
 
-	removed, err := quarantineRemoveOwnedFile(path, merlinSnapshotHash(owned))
-	if err == nil {
-		t.Fatal("expected modified snapshot cleanup refusal")
+	same, err := sameFilePaths(original, hardLink)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !removed {
-		t.Fatal("expected modified snapshot to be captured and restored")
+	if !same {
+		t.Fatal("hard link to same inode was not recognized")
 	}
-	got, readErr := os.ReadFile(path)
-	if readErr != nil {
-		t.Fatal(readErr)
+	same, err = sameFilePaths(original, copyPath)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !bytes.Equal(got, modified) {
-		t.Fatalf("modified snapshot was not restored byte-for-byte:\nwant: %q\ngot:  %q", modified, got)
+	if same {
+		t.Fatal("byte-identical copy must not be treated as the owned inode")
+	}
+}
+
+func Test_encodeMainSnapshotStateAcceptsEveryTransactionPhase(t *testing.T) {
+	hash := merlinSnapshotHash([]byte("owned"))
+	for _, phase := range []string{
+		snapshotPhasePending,
+		snapshotPhasePublished,
+		snapshotPhaseQuarantine,
+		snapshotPhaseDelete,
+		snapshotPhaseRestore,
+		snapshotPhaseRestored,
+	} {
+		if _, err := encodeMainSnapshotState(mainSnapshotState{phase: phase, hash: hash}); err != nil {
+			t.Fatalf("phase %q rejected: %v", phase, err)
+		}
 	}
 }
