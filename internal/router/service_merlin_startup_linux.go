@@ -12,7 +12,7 @@ import (
 )
 
 func prepareExistingMerlinStartupScript(path string, expected, legacy []byte) (exists bool, retErr error) {
-	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
+	fd, err := unix.Open(path, unix.O_RDWR|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
 	if err != nil {
 		if err == unix.ENOENT {
 			return false, nil
