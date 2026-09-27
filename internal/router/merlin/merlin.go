@@ -217,7 +217,13 @@ func (m *Merlin) writeDnsmasqPostconf() error {
 		dnsmasq.MerlinPostConfEndMarker,
 	}, "\n"))
 
-	paths := []string{dnsmasq.MerlinPostConfPath, dnsmasq.MerlinSdnPostConfPath}
+	return writeMerlinHookUpdates(
+		[]string{dnsmasq.MerlinPostConfPath, dnsmasq.MerlinSdnPostConfPath},
+		block,
+	)
+}
+
+func writeMerlinHookUpdates(paths []string, block []byte) error {
 	updates := make([]merlinHookUpdate, 0, len(paths))
 	for _, path := range paths {
 		update, err := prepareMerlinHookUpdate(path, block)
