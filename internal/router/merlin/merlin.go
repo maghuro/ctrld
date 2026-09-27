@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -649,6 +650,26 @@ func atomicWriteFile(path string, data []byte, mode os.FileMode) (err error) {
 		return err
 	}
 	if err = os.Rename(tmpName, target); err != nil {
+		return err
+	}
+	if err = syncParentDir(dir); err != nil {
+		return err
+	}
+	return nil
+}
+
+func syncParentDir(dir string) error {
+	f, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if err := f.Sync(); err != nil {
+		// Directory fsync is not supported by the Windows CI filesystem. Merlin
+		// itself is Unix-only, where this is required for rename durability.
+		if runtime.GOOS == "windows" {
+			return nil
+		}
 		return err
 	}
 	return nil
