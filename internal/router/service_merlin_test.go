@@ -3,6 +3,7 @@ package router
 import (
 	"bytes"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -117,5 +118,58 @@ func TestMerlinServiceStatusTreatsStoppedAsState(t *testing.T) {
 func TestMerlinServiceStatusRejectsUnexpectedOutput(t *testing.T) {
 	if _, err := merlinServiceStatus([]byte("mystery\n"), nil); err == nil {
 		t.Fatal("expected unexpected status output to return an error")
+	}
+}
+
+
+func TestWriteMerlinStartupScriptPublishesAndPreservesMode(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ctrld.startup")
+	want := []byte("#!/bin/sh\necho ok\n")
+
+	published, err := writeMerlinStartupScript(path, want, 0755)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !published {
+		t.Fatal("expected startup script to be published")
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("startup script contents mismatch: got %q want %q", got, want)
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode().Perm() != 0755 {
+		t.Fatalf("startup script mode = %o, want 755", fi.Mode().Perm())
+	}
+}
+
+func TestWriteMerlinStartupScriptDoesNotClobberExistingTarget(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ctrld.startup")
+	original := []byte("user-owned\n")
+	if err := os.WriteFile(path, original, 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	published, err := writeMerlinStartupScript(path, []byte("ctrld-owned\n"), 0755)
+	if err == nil {
+		t.Fatal("expected publication to fail for existing target")
+	}
+	if published {
+		t.Fatal("existing target must not be reported as ctrld-published")
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, original) {
+		t.Fatalf("existing target was modified: got %q want %q", got, original)
 	}
 }
