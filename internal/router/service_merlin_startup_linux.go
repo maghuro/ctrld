@@ -117,9 +117,12 @@ func replaceMerlinStartupScriptAtomically(path string, expected, legacy []byte, 
 		return err
 	}
 	tmpPath := tmp.Name()
+	removeTmp := true
 	defer func() {
 		_ = tmp.Close()
-		_ = os.Remove(tmpPath)
+		if removeTmp {
+			_ = os.Remove(tmpPath)
+		}
 	}()
 
 	if err := tmp.Chmod(0755); err != nil {
@@ -129,6 +132,10 @@ func replaceMerlinStartupScriptAtomically(path string, expected, legacy []byte, 
 		return err
 	}
 	if err := tmp.Sync(); err != nil {
+		return err
+	}
+	preparedInfo, err := tmp.Stat()
+	if err != nil {
 		return err
 	}
 	if err := tmp.Close(); err != nil {
@@ -149,12 +156,42 @@ func replaceMerlinStartupScriptAtomically(path string, expected, legacy []byte, 
 	}
 
 	rollbackExchange := func(cause error) error {
+		// Do not exchange back by pathname unless path still names the exact
+		// prepared inode and bytes that this invocation installed. An external
+		// actor may have replaced or edited path after our first exchange; blindly
+		// exchanging in that case would overwrite their change with the legacy
+		// file. If ownership is no longer provable, preserve the captured legacy
+		// inode at tmpPath as a quarantine artifact instead.
+		pathInfo, statErr := os.Lstat(path)
+		if statErr != nil || !pathInfo.Mode().IsRegular() || !os.SameFile(preparedInfo, pathInfo) {
+			removeTmp = false
+			_ = syncMerlinServiceDir(dir)
+			if statErr != nil {
+				return fmt.Errorf("%v; cannot safely restore startup script after exchange: %w; legacy preserved at %s", cause, statErr, tmpPath)
+			}
+			return fmt.Errorf("%v; startup script changed after exchange; legacy preserved at %s", cause, tmpPath)
+		}
+		pathBytes, exists, readErr := readExistingMerlinStartupScript(path)
+		if readErr != nil || !exists || !bytes.Equal(pathBytes, expected) {
+			removeTmp = false
+			_ = syncMerlinServiceDir(dir)
+			if readErr != nil {
+				return fmt.Errorf("%v; cannot verify replacement before rollback: %w; legacy preserved at %s", cause, readErr, tmpPath)
+			}
+			return fmt.Errorf("%v; replacement changed after exchange; legacy preserved at %s", cause, tmpPath)
+		}
+
 		if err := unix.Renameat2(
 			unix.AT_FDCWD, tmpPath,
 			unix.AT_FDCWD, path,
 			unix.RENAME_EXCHANGE,
 		); err != nil {
-			return fmt.Errorf("%v; failed to restore startup script after exchange: %w", cause, err)
+			removeTmp = false
+			_ = syncMerlinServiceDir(dir)
+			return fmt.Errorf("%v; failed to restore startup script after exchange: %w; legacy preserved at %s", cause, err, tmpPath)
+		}
+		if err := syncMerlinServiceDir(dir); err != nil {
+			return fmt.Errorf("%v; startup script restored but directory sync failed: %w", cause, err)
 		}
 		return cause
 	}
