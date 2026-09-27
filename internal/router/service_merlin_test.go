@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -134,6 +135,9 @@ func TestMerlinServiceStatusRejectsUnexpectedOutput(t *testing.T) {
 
 
 func TestWriteMerlinStartupScriptPublishesAndPreservesMode(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows filesystems do not expose POSIX executable mode semantics")
+	}
 	dir := t.TempDir()
 	path := filepath.Join(dir, "ctrld.startup")
 	want := []byte("#!/bin/sh\necho ok\n")
@@ -201,6 +205,9 @@ func TestMerlinServiceEventValidatesDnsmasqPidOwnership(t *testing.T) {
 
 
 func TestValidateMerlinSharedHookPath(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Merlin shared hooks are POSIX shell files and executable-bit checks are Unix-specific")
+	}
 	dir := t.TempDir()
 	path := filepath.Join(dir, "services-start")
 
