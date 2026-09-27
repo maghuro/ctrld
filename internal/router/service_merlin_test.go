@@ -20,10 +20,15 @@ func TestMerlinServiceScriptValidatesPidOwnership(t *testing.T) {
 		`[ -r "/proc/$pid/cmdline" ]`,
 		`tr '\000' ' '`,
 		`"$exe"|"$exe "*`,
+		`is_running_pid "$pid"`,
+		`kill "$pid"`,
 	} {
 		if !strings.Contains(merlinSvcScript, want) {
 			t.Fatalf("Merlin service script missing PID ownership check %q", want)
 		}
+	}
+	if strings.Contains(merlinSvcScript, `kill "$(get_pid)"`) {
+		t.Fatal("stop must kill the same PID whose ctrld ownership was validated")
 	}
 }
 
