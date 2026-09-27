@@ -395,3 +395,103 @@ func TestPrepareExistingMerlinStartupScriptRejectsUnknownCustomization(t *testin
 		t.Fatalf("custom startup script was modified: got %q want %q", got, custom)
 	}
 }
+
+
+func TestRefreshMerlinStartupScriptRecoversInstalledLegacyArguments(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Merlin startup scripts are Linux-specific")
+	}
+	dir := t.TempDir()
+	exe := filepath.Join(dir, "ctrld")
+
+	installedSvc := &merlinSvc{Config: &service.Config{
+		Name:       "ctrld",
+		Executable: exe,
+		Arguments:  []string{"run", "--cd=abcd1234", "--config=/jffs/controld/ctrld.toml"},
+	}}
+	_, legacy, err := installedSvc.renderStartupScripts(exe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(exe+".startup", legacy, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Normal restart/upgrade service construction does not carry the original
+	// installed Arguments.
+	lifecycleSvc := &merlinSvc{Config: &service.Config{
+		Name:       "ctrld",
+		Executable: exe,
+	}}
+	if err := lifecycleSvc.refreshMerlinStartupScript(); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := os.ReadFile(exe + ".startup")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !merlinStartupScriptHasMarker(got) {
+		t.Fatal("migrated startup script is missing the current ctrld marker")
+	}
+	for _, want := range []string{
+		merlinShellQuote("--cd=abcd1234"),
+		merlinShellQuote("--config=/jffs/controld/ctrld.toml"),
+	} {
+		if !bytes.Contains(got, []byte(want)) {
+			t.Fatalf("migrated startup script lost installed argument %q", want)
+		}
+	}
+}
+
+func TestRefreshMerlinStartupScriptLeavesCurrentMarkedScriptUntouched(t *testing.T) {
+	dir := t.TempDir()
+	exe := filepath.Join(dir, "ctrld")
+	path := exe + ".startup"
+	original := []byte("#!/bin/sh\n" + merlinSvcScriptMarker + "\necho custom-current-body\n")
+	if err := os.WriteFile(path, original, 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	s := &merlinSvc{Config: &service.Config{Name: "ctrld", Executable: exe}}
+	if err := s.refreshMerlinStartupScript(); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, original) {
+		t.Fatalf("current marked script was rewritten:\nwant: %q\ngot:  %q", original, got)
+	}
+}
+
+func TestRefreshMerlinStartupScriptLeavesUnknownCustomizationUntouched(t *testing.T) {
+	dir := t.TempDir()
+	exe := filepath.Join(dir, "ctrld")
+	path := exe + ".startup"
+	original := []byte("#!/bin/sh\necho user-custom-startup\n")
+	if err := os.WriteFile(path, original, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	s := &merlinSvc{Config: &service.Config{Name: "ctrld", Executable: exe}}
+	if err := s.refreshMerlinStartupScript(); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, original) {
+		t.Fatalf("unknown customized script was modified:\nwant: %q\ngot:  %q", original, got)
+	}
+}
+
+func TestRecoverLegacyMerlinServiceConfigRejectsWrongExecutable(t *testing.T) {
+	base := &service.Config{Name: "ctrld", Executable: "/jffs/controld/ctrld"}
+	buf := []byte("#!/bin/sh\ncmd=\"/tmp/other run --cd=abc\"\n")
+	if _, ok := recoverLegacyMerlinServiceConfig(buf, base, base.Executable); ok {
+		t.Fatal("legacy config recovery accepted a different executable")
+	}
+}
