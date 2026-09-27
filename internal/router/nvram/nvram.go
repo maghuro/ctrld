@@ -39,11 +39,47 @@ NOTE:
 // SetKV writes the given key/value from map to nvram.
 // The given setupKey is set to 1 to indicate key/value set.
 //
-// NVRAM mutations are not transactional. Keep enough rollback information in
-// volatile NVRAM and restore it on any failure so callers never have to infer
-// whether a partially failed sequence changed router state.
+// Keep the long-standing generic semantics for router backends which do not
+// have Merlin's retrying PreRun reconciliation.
 func SetKV(m map[string]string, setupKey string) error {
+	for key, value := range m {
+		old, err := Run("get", key)
+		if err != nil {
+			return fmt.Errorf("%s: %w", old, err)
+		}
+		if out, err := Run("set", CtrldKeyPrefix+key+"="+old); err != nil {
+			return fmt.Errorf("%s: %w", out, err)
+		}
+		if out, err := Run("set", key+"="+value); err != nil {
+			return fmt.Errorf("%s: %w", out, err)
+		}
+	}
+	if out, err := Run("set", setupKey+"=1"); err != nil {
+		return fmt.Errorf("%s: %w", out, err)
+	}
+	if out, err := Run("commit"); err != nil {
+		return fmt.Errorf("%s: %w", out, err)
+	}
+	return nil
+}
+
+// SetKVWithVolatileRetryMarker is Merlin's transactional SetKV variant.
+// It rolls back partially-applied values on failure. If that rollback cannot
+// be made durable, setupKey is re-armed only in volatile NVRAM so Merlin's
+// deferred/retrying Cleanup can reconcile the same boot without persisting a
+// false "setup completed" marker for the next boot.
+func SetKVWithVolatileRetryMarker(m map[string]string, setupKey string) error {
 	modified := make([]string, 0, len(m))
+
+	rearmVolatile := func(cause error) error {
+		if out, err := Run("set", setupKey+"=1"); err != nil {
+			return errors.Join(
+				cause,
+				fmt.Errorf("failed to re-arm volatile %s: %s: %w", setupKey, out, err),
+			)
+		}
+		return cause
+	}
 
 	rollback := func(cause error) error {
 		var restoreErr error
@@ -59,43 +95,21 @@ func SetKV(m map[string]string, setupKey string) error {
 				restoreErr = errors.Join(restoreErr, fmt.Errorf("%s: %w", out, err))
 			}
 		}
-
 		if restoreErr != nil {
-			// At least one ctrld-modified value may still be active. Keep an
-			// explicit setup marker so Merlin Cleanup/Restore will retry from the
-			// retained ctrld_* backup values instead of treating the state as clean.
-			var markerErr error
-			if out, err := Run("set", setupKey+"=1"); err != nil {
-				markerErr = errors.Join(markerErr, fmt.Errorf("%s: %w", out, err))
-			}
-			if out, err := Run("commit"); err != nil {
-				markerErr = errors.Join(markerErr, fmt.Errorf("%s: %w", out, err))
-			}
-			return errors.Join(
+			return rearmVolatile(errors.Join(
 				cause,
 				fmt.Errorf("nvram rollback incomplete: %w", restoreErr),
-				markerErr,
-			)
+			))
 		}
 
 		if out, err := Run("unset", setupKey); err != nil {
-			return errors.Join(cause, fmt.Errorf("%s: %w", out, err))
+			return rearmVolatile(errors.Join(cause, fmt.Errorf("%s: %w", out, err)))
 		}
-		if _, err := Run("commit"); err != nil {
-			// The restored values may only be volatile. Re-arm the marker before
-			// returning so the caller's deferred Cleanup has a retryable state.
-			var markerErr error
-			if out, setErr := Run("set", setupKey+"=1"); setErr != nil {
-				markerErr = errors.Join(markerErr, fmt.Errorf("%s: %w", out, setErr))
-			}
-			if out, commitErr := Run("commit"); commitErr != nil {
-				markerErr = errors.Join(markerErr, fmt.Errorf("%s: %w", out, commitErr))
-			}
-			return errors.Join(
+		if out, err := Run("commit"); err != nil {
+			return rearmVolatile(errors.Join(
 				cause,
-				fmt.Errorf("nvram rollback commit failed: %w", err),
-				markerErr,
-			)
+				fmt.Errorf("nvram rollback commit failed: %s: %w", out, err),
+			))
 		}
 		return cause
 	}
