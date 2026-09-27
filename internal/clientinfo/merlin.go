@@ -2,6 +2,7 @@ package clientinfo
 
 import (
 	"strings"
+	"sync"
 	"sync/atomic"
 
 	"github.com/Control-D-Inc/ctrld/internal/router"
@@ -14,6 +15,9 @@ import (
 const merlinNvramCustomClientListKey = "custom_clientlist"
 
 type merlinDiscover struct {
+	// Serialize the read+publish refresh transaction. Lookups remain lock-free.
+	refreshMu sync.Mutex
+
 	// Each published map is immutable. Refresh builds a complete replacement
 	// off to the side and swaps the pointer once, so concurrent lookups never
 	// observe an empty/partial/interleaved custom_clientlist snapshot.
@@ -24,6 +28,9 @@ func (m *merlinDiscover) refresh() error {
 	if router.Name() != merlin.Name {
 		return nil
 	}
+	m.refreshMu.Lock()
+	defer m.refreshMu.Unlock()
+
 	out, err := nvram.Run("get", merlinNvramCustomClientListKey)
 	if err != nil {
 		return err
