@@ -67,6 +67,53 @@ func (s *merlinSvc) template() *template.Template {
 	}).Parse(merlinSvcScript))
 }
 
+func (s *merlinSvc) legacyTemplate() *template.Template {
+	return template.Must(template.New("").Parse(merlinLegacySvcScript))
+}
+
+func (s *merlinSvc) renderStartupScripts(exePath string) (current, legacy []byte, err error) {
+	data := &struct {
+		*service.Config
+		Path string
+	}{
+		s.Config,
+		exePath,
+	}
+
+	var currentBuf bytes.Buffer
+	if err := s.template().Execute(&currentBuf, data); err != nil {
+		return nil, nil, fmt.Errorf("render current Merlin startup script: %w", err)
+	}
+	var legacyBuf bytes.Buffer
+	if err := s.legacyTemplate().Execute(&legacyBuf, data); err != nil {
+		return nil, nil, fmt.Errorf("render legacy Merlin startup script: %w", err)
+	}
+	return currentBuf.Bytes(), legacyBuf.Bytes(), nil
+}
+
+func (s *merlinSvc) refreshMerlinStartupScript() error {
+	exePath := s.Config.Executable
+	if exePath == "" {
+		var err error
+		exePath, err = os.Executable()
+		if err != nil {
+			return err
+		}
+	}
+	current, legacy, err := s.renderStartupScripts(exePath)
+	if err != nil {
+		return err
+	}
+	exists, err := prepareExistingMerlinStartupScript(s.configPath(), current, legacy)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return service.ErrNotInstalled
+	}
+	return nil
+}
+
 func merlinShellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'"
 }
@@ -195,6 +242,10 @@ func validateMerlinSharedHookPath(path string, requireExecutable bool) (exists b
 }
 
 func (s *merlinSvc) Install() error {
+	return withMerlinServiceLock(s.installLocked)
+}
+
+func (s *merlinSvc) installLocked() error {
 	exePath, err := os.Executable()
 	if err != nil {
 		return err
@@ -212,27 +263,20 @@ func (s *merlinSvc) Install() error {
 
 	confPath := s.configPath()
 
-	var to = &struct {
-		*service.Config
-		Path string
-	}{
-		s.Config,
-		exePath,
-	}
-
-	// Render completely before touching the destination. A template error must
-	// not leave a truncated startup script which then looks "already installed".
-	var rendered bytes.Buffer
-	if err := s.template().Execute(&rendered, to); err != nil {
-		return fmt.Errorf("s.template.Execute: %w", err)
+	// Render both current and last-known legacy templates before touching the
+	// destination. An exact legacy match can be migrated safely during install
+	// or upgrade; any other differing file is treated as user-owned.
+	currentStartup, legacyStartup, err := s.renderStartupScripts(exePath)
+	if err != nil {
+		return err
 	}
 	startupPublished := false
-	startupExists, err := prepareExistingMerlinStartupScript(confPath, rendered.Bytes())
+	startupExists, err := prepareExistingMerlinStartupScript(confPath, currentStartup, legacyStartup)
 	if err != nil {
 		return fmt.Errorf("prepare existing startup script: %w", err)
 	}
 	if !startupExists {
-		startupPublished, err = writeMerlinStartupScript(confPath, rendered.Bytes(), 0755)
+		startupPublished, err = writeMerlinStartupScript(confPath, currentStartup, 0755)
 		if err != nil {
 			if startupPublished {
 				_ = os.Remove(confPath)
@@ -373,6 +417,10 @@ func (s *merlinSvc) Install() error {
 }
 
 func (s *merlinSvc) Uninstall() error {
+	return withMerlinServiceLock(s.uninstallLocked)
+}
+
+func (s *merlinSvc) uninstallLocked() error {
 	tmpScript, err := os.CreateTemp("", "ctrld_uninstall")
 	if err != nil {
 		return fmt.Errorf("os.CreateTemp: %w", err)
@@ -485,7 +533,15 @@ func merlinServiceStatus(out []byte, cmdErr error) (service.Status, error) {
 }
 
 func (s *merlinSvc) Start() error {
-	return exec.Command(s.configPath(), "start").Run()
+	return withMerlinServiceLock(func() error {
+		// Upgrades replace only the binary before restarting the service. Refresh
+		// an exact ctrld-owned legacy startup script here so lifecycle/security
+		// fixes reach existing installations without requiring a reinstall.
+		if err := s.refreshMerlinStartupScript(); err != nil {
+			return err
+		}
+		return exec.Command(s.configPath(), "start").Run()
+	})
 }
 
 func (s *merlinSvc) Stop() error {
@@ -499,6 +555,88 @@ func (s *merlinSvc) Restart() error {
 	}
 	return s.Start()
 }
+
+const merlinLegacySvcScript = `#!/bin/sh
+
+name="{{.Name}}"
+cmd="{{.Path}}{{range .Arguments}} {{.}}{{end}}"
+pid_file="/tmp/$name.pid"
+
+get_pid() {
+  cat "$pid_file"
+}
+
+is_running() {
+  [ -f "$pid_file" ] && ps | grep -q "^ *$(get_pid) "
+}
+
+case "$1" in
+  start)
+    if is_running; then
+      logger -c "Already started"
+    else
+      logger -c "Starting $name"
+      if [ -f /rom/ca-bundle.crt ]; then
+        # For John’s fork
+        export SSL_CERT_FILE=/rom/ca-bundle.crt
+      fi
+      $cmd &
+      echo $! > "$pid_file"
+      chmod 600 "$pid_file"
+      if ! is_running; then
+       logger -c "Failed to start $name"
+       exit 1
+      fi
+    fi
+  ;;
+  stop)
+    if is_running; then
+      logger -c "Stopping $name..."
+      kill "$(get_pid)"
+      for _ in 1 2 3 4 5; do
+        if ! is_running; then
+          logger -c "stopped"
+          if [ -f "$pid_file" ]; then
+            rm "$pid_file"
+          fi
+          exit 0
+        fi
+        printf "."
+        sleep 2
+      done
+      logger -c "failed to stop $name"
+      exit 1
+    fi
+    exit 0
+  ;;
+  restart)
+    $0 stop
+    $0 start
+  ;;
+  status)
+    if is_running; then
+      echo "running"
+    else
+      echo "stopped"
+      exit 1
+    fi
+  ;;
+  service_event)
+    event=$2
+    svc=$3
+    dnsmasq_pid_file=$(sed -n '/pid-file=/s///p' /etc/dnsmasq.conf)
+
+    if [ "$event" = "restart" ] && [ "$svc" = "diskmon" ]; then
+      kill "$(cat "$dnsmasq_pid_file")" >/dev/null 2>&1
+    fi
+  ;;
+  *)
+    echo "Usage: $0 {start|stop|restart|status}"
+    exit 1
+  ;;
+esac
+exit 0
+`
 
 const merlinSvcScript = `#!/bin/sh
 
