@@ -292,44 +292,50 @@ func syncMerlinServiceDir(dir string) error {
 	return f.Sync()
 }
 
-func createMerlinSharedHookStub(path string) (retErr error) {
-	stub, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+func createMerlinSharedHookStub(path string) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".ctrld-*")
 	if err != nil {
 		return err
 	}
-	closed := false
+	tmpPath := tmp.Name()
 	defer func() {
-		if !closed {
-			_ = stub.Close()
-		}
-		if retErr != nil {
-			_ = os.Remove(path)
-			_ = syncMerlinServiceDir(filepath.Dir(path))
-		}
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
 	}()
 
-	// OpenFile creation mode is filtered through the process umask. Merlin must
-	// execute services-start/service-event at boot, so set the final mode
-	// explicitly on the already-open inode before making it durable.
-	if err := stub.Chmod(0755); err != nil {
+	// Build the complete executable stub privately first. Publishing only after
+	// chmod/write/fsync succeed means a short write or ENOSPC can never leave a
+	// partial shared hook at the public path.
+	if err := tmp.Chmod(0755); err != nil {
 		return err
 	}
-	if _, err := stub.Write([]byte("#!/bin/sh\n")); err != nil {
+	if _, err := tmp.Write([]byte("#!/bin/sh\n")); err != nil {
 		return err
 	}
-	if err := stub.Sync(); err != nil {
+	if err := tmp.Sync(); err != nil {
 		return err
 	}
-	if err := stub.Close(); err != nil {
+	if err := tmp.Close(); err != nil {
 		return err
 	}
-	closed = true
-	if err := syncMerlinServiceDir(filepath.Dir(path)); err != nil {
+
+	// Publish with no-clobber semantics. If another addon creates or replaces
+	// the hook while we are preparing the stub, Link returns EEXIST and the
+	// caller revalidates that actor's file instead of truncating or deleting it.
+	if err := os.Link(tmpPath, path); err != nil {
+		return err
+	}
+	if err := os.Remove(tmpPath); err != nil {
+		return err
+	}
+	if err := syncMerlinServiceDir(dir); err != nil {
+		// The public stub may already be durable. Keep it in place so a retry can
+		// revalidate/reuse it; never roll back a shared pathname after publish.
 		return err
 	}
 	return nil
 }
-
 func validateMerlinSharedHookPath(path string, requireExecutable bool) (exists bool, err error) {
 	info, err := os.Lstat(path)
 	if os.IsNotExist(err) {
@@ -798,8 +804,9 @@ get_pid() {
   printf '%s\n' "$pid"
 }
 
-is_running() {
-  pid="$(get_pid)" || return 1
+is_running_pid() {
+  pid=$1
+  [ -n "$pid" ] || return 1
   [ -r "/proc/$pid/cmdline" ] || return 1
   process_cmd="$(tr '\000' ' ' < "/proc/$pid/cmdline" 2>/dev/null)" || return 1
   case "$process_cmd" in
@@ -808,6 +815,10 @@ is_running() {
   esac
 }
 
+is_running() {
+  pid="$(get_pid)" || return 1
+  is_running_pid "$pid"
+}
 case "$1" in
   start)
     if is_running; then
@@ -838,11 +849,15 @@ case "$1" in
     fi
   ;;
   stop)
-    if is_running; then
+    pid="$(get_pid)" || {
+      rm -f "$pid_file"
+      exit 0
+    }
+    if is_running_pid "$pid"; then
       logger -c "Stopping $name..."
-      kill "$(get_pid)"
+      kill "$pid"
       for _ in 1 2 3 4 5; do
-        if ! is_running; then
+        if ! is_running_pid "$pid"; then
           logger -c "stopped"
           if [ -f "$pid_file" ]; then
             rm "$pid_file"
