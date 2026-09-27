@@ -76,6 +76,10 @@ func merlinStartupHookLines(configPath string) (startLine, serviceEventLine stri
 	return path + " start", path + ` service_event "$1" "$2"`
 }
 
+func merlinLegacyStartupHookLines(configPath string) (startLine, serviceEventLine string) {
+	return configPath + " start", configPath + ` service_event "$1" "$2"`
+}
+
 func writeMerlinStartupScript(path string, data []byte, mode os.FileMode) (published bool, retErr error) {
 	dir := filepath.Dir(path)
 	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".ctrld-*")
@@ -247,15 +251,51 @@ func (s *merlinSvc) Install() error {
 	}
 
 	addLineToScript := func(line, script string) (created, added bool, retErr error) {
-		exists, err := validateMerlinSharedHookPath(script, true)
-		if err != nil {
-			return false, false, err
-		}
-		if !exists {
-			if err := os.WriteFile(script, []byte("#!/bin/sh\n"), 0755); err != nil {
+		for {
+			exists, err := validateMerlinSharedHookPath(script, true)
+			if err != nil {
+				return false, false, err
+			}
+			if exists {
+				break
+			}
+
+			// Create a missing shared hook without following a raced symlink or
+			// truncating a file another addon created after our Lstat.
+			stub, err := os.OpenFile(script, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0755)
+			if os.IsExist(err) {
+				// Another actor won the race. Re-run Lstat validation against
+				// the now-existing path before deciding whether it is safe.
+				continue
+			}
+			if err != nil {
 				return false, false, err
 			}
 			created = true
+			stubData := []byte("#!/bin/sh\n")
+			if _, err := stub.Write(stubData); err != nil {
+				_ = stub.Close()
+				_ = os.Remove(script)
+				_ = syncMerlinServiceDir(filepath.Dir(script))
+				return false, false, err
+			}
+			if err := stub.Sync(); err != nil {
+				_ = stub.Close()
+				_ = os.Remove(script)
+				_ = syncMerlinServiceDir(filepath.Dir(script))
+				return false, false, err
+			}
+			if err := stub.Close(); err != nil {
+				_ = os.Remove(script)
+				_ = syncMerlinServiceDir(filepath.Dir(script))
+				return false, false, err
+			}
+			if err := syncMerlinServiceDir(filepath.Dir(script)); err != nil {
+				_ = os.Remove(script)
+				_ = syncMerlinServiceDir(filepath.Dir(script))
+				return false, false, err
+			}
+			break
 		}
 		defer func() {
 			if retErr != nil && created {
@@ -360,12 +400,18 @@ func (s *merlinSvc) Uninstall() error {
 	}
 
 	startLine, serviceEventLine := merlinStartupHookLines(s.configPath())
-	for script, line := range map[string]string{
-		merlinJFFSScriptPath:             startLine,
-		merlinJFFSServiceEventScriptPath: serviceEventLine,
+	legacyStartLine, legacyServiceEventLine := merlinLegacyStartupHookLines(s.configPath())
+	for _, hook := range []struct {
+		script string
+		lines  []string
+	}{
+		{merlinJFFSScriptPath, []string{startLine, legacyStartLine}},
+		{merlinJFFSServiceEventScriptPath, []string{serviceEventLine, legacyServiceEventLine}},
 	} {
-		if err := removeLineFromScript(line, script); err != nil {
-			return err
+		for _, line := range hook.lines {
+			if err := removeLineFromScript(line, hook.script); err != nil {
+				return err
+			}
 		}
 	}
 
