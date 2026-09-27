@@ -11,7 +11,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func prepareExistingMerlinStartupScript(path string, expected []byte) (exists bool, retErr error) {
+func prepareExistingMerlinStartupScript(path string, expected, legacy []byte) (exists bool, retErr error) {
 	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
 	if err != nil {
 		if err == unix.ENOENT {
@@ -46,18 +46,41 @@ func prepareExistingMerlinStartupScript(path string, expected []byte) (exists bo
 	if err != nil {
 		return true, err
 	}
-	if !bytes.Equal(got, expected) {
+	needsMigration := bytes.Equal(got, legacy) && !bytes.Equal(got, expected)
+	if !bytes.Equal(got, expected) && !needsMigration {
 		return true, fmt.Errorf("already installed with different startup script: %s", path)
 	}
 
-	// Keep validation, content comparison and chmod pinned to the same inode.
-	// O_NOFOLLOW prevents a pathname race from redirecting any of these
-	// privileged operations through a symlink.
+	// Keep validation, content comparison, optional legacy migration and chmod
+	// pinned to the same inode. O_NOFOLLOW prevents a pathname race from
+	// redirecting privileged operations through a symlink.
+	if needsMigration {
+		if _, err := f.Seek(0, io.SeekStart); err != nil {
+			return true, err
+		}
+		if err := f.Truncate(0); err != nil {
+			return true, err
+		}
+		if _, err := f.Write(expected); err != nil {
+			return true, err
+		}
+	}
 	if err := f.Chmod(0755); err != nil {
 		return true, err
 	}
 	if err := f.Sync(); err != nil {
 		return true, err
+	}
+
+	// Confirm the pathname still names the same inode we validated/migrated.
+	// If another lifecycle operation replaced it, leave that replacement alone
+	// and report the race to the caller.
+	pathInfo, err := os.Lstat(path)
+	if err != nil {
+		return true, err
+	}
+	if !os.SameFile(info, pathInfo) {
+		return true, fmt.Errorf("startup script changed during preparation: %s", path)
 	}
 	return true, nil
 }
