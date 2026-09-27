@@ -378,29 +378,19 @@ func (s *merlinSvc) installLocked() error {
 	if err != nil {
 		return err
 	}
-	startupPublished := false
 	startupExists, err := prepareExistingMerlinStartupScript(confPath, currentStartup, legacyStartup)
 	if err != nil {
 		return fmt.Errorf("prepare existing startup script: %w", err)
 	}
 	if !startupExists {
-		startupPublished, err = writeMerlinStartupScript(confPath, currentStartup, 0755)
-		if err != nil {
-			if startupPublished {
-				_ = os.Remove(confPath)
-				_ = syncMerlinServiceDir(filepath.Dir(confPath))
-			}
+		if _, err := writeMerlinStartupScript(confPath, currentStartup, 0755); err != nil {
+			// A successfully linked private startup script is intentionally kept
+			// even if a later durability/hook step fails. It does not register the
+			// service by itself, is safe to recognize on retry, and avoiding
+			// pathname-based rollback prevents deleting an external replacement.
 			return fmt.Errorf("publish startup script: %w", err)
 		}
 	}
-
-	installComplete := false
-	defer func() {
-		if !installComplete && startupPublished {
-			_ = os.Remove(confPath)
-			_ = syncMerlinServiceDir(filepath.Dir(confPath))
-		}
-	}()
 
 	if err := os.MkdirAll(filepath.Dir(merlinJFFSScriptPath), 0755); err != nil {
 		return fmt.Errorf("os.MkdirAll: %w", err)
@@ -520,7 +510,6 @@ func (s *merlinSvc) installLocked() error {
 		installed = append(installed, hook)
 	}
 
-	installComplete = true
 	return nil
 }
 
