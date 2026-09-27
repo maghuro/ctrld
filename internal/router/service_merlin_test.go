@@ -59,12 +59,33 @@ func TestMerlinServiceTemplateRendersExecutableIdentity(t *testing.T) {
 	}
 	got := buf.String()
 	for _, want := range []string{
-		`exe="/jffs/controld/ctrld"`,
-		`cmd="/jffs/controld/ctrld run --cd example"`,
+		`exe='/jffs/controld/ctrld'`,
+		`'/jffs/controld/ctrld' 'run' '--cd' 'example' &`,
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("rendered Merlin startup script missing %q", want)
 		}
+	}
+}
+
+func TestMerlinServiceTemplatePreservesArgumentBoundaries(t *testing.T) {
+	s := &merlinSvc{
+		Config: &service.Config{
+			Name:       "ctrld",
+			Executable: "/jffs/controld/ctrld",
+			Arguments:  []string{"run", "--log", "/jffs/log dir/it's.log"},
+		},
+	}
+	var buf bytes.Buffer
+	if err := s.template().Execute(&buf, struct {
+		*service.Config
+		Path string
+	}{s.Config, s.Config.Executable}); err != nil {
+		t.Fatal(err)
+	}
+	want := `'/jffs/controld/ctrld' 'run' '--log' '/jffs/log dir/it'"'"'s.log' &`
+	if !strings.Contains(buf.String(), want) {
+		t.Fatalf("rendered command lost shell argument boundaries:\nwant substring: %q\ngot:\n%s", want, buf.String())
 	}
 }
 
