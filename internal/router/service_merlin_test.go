@@ -173,3 +173,17 @@ func TestWriteMerlinStartupScriptDoesNotClobberExistingTarget(t *testing.T) {
 		t.Fatalf("existing target was modified: got %q want %q", got, original)
 	}
 }
+
+
+func TestMerlinServiceEventValidatesDnsmasqPidOwnership(t *testing.T) {
+	for _, want := range []string{
+		`case "$dnsmasq_pid" in`,
+		`[ -r "/proc/$dnsmasq_pid/cmdline" ]`,
+		`tr '\000' '\n'`,
+		`dnsmasq|*/dnsmasq) kill "$dnsmasq_pid"`,
+	} {
+		if !strings.Contains(merlinSvcScript, want) {
+			t.Fatalf("Merlin service_event missing dnsmasq PID ownership check %q", want)
+		}
+	}
+}
