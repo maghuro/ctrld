@@ -109,6 +109,12 @@ func ensureMerlinStateDir() error {
 		if !info.IsDir() {
 			return fmt.Errorf("Merlin state path is not a directory: %s", merlinStateDir)
 		}
+		// Always re-sync the parent before relying on state below this
+		// directory. This also closes the retry window where mkdir succeeded
+		// previously but the parent fsync reported a transient failure.
+		if err := syncParentDir(filepath.Dir(merlinStateDir)); err != nil {
+			return fmt.Errorf("sync parent of existing Merlin state directory %s: %w", merlinStateDir, err)
+		}
 		return nil
 	} else if !os.IsNotExist(err) {
 		return fmt.Errorf("stat Merlin state directory %s: %w", merlinStateDir, err)
