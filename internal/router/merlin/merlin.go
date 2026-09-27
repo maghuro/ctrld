@@ -567,34 +567,36 @@ func cleanupLegacySnapshots(journal *legacyCleanupJournal) error {
 	return nil
 }
 
-// cleanupPendingLegacySnapshot captures the exact pathname into a private
-// quarantine before deletion. The pre-rename FileInfo is compared with the
-// quarantined inode, so an atomic replacement between validation and rename is
-// detected even when the replacement has byte-identical contents.
-//
-// If a retry finds a quarantine while the durable entry is still "pending", the
-// previous attempt may have crashed after rename but before proving identity.
-// In that ambiguous state we restore rather than delete.
+// cleanupPendingLegacySnapshot uses the private hard-link captured before
+// journal publication as the durable identity proof for the original legacy
+// snapshot. Public-path hashes alone are never treated as ownership. A rename
+// race is detected by comparing the quarantined inode with that anchor; any
+// ambiguous or unproven quarantined data is restored rather than deleted.
 func cleanupPendingLegacySnapshot(journal *legacyCleanupJournal, index int) error {
 	entry := journal.entries[index]
 	qpath := legacySnapshotQuarantinePath(entry.path)
 	anchor := legacySnapshotAnchorPath(entry.path)
 
-	anchorExists, err := pathExists(anchor)
-	if err != nil {
-		return err
-	}
-	if !anchorExists {
-		// The durable journal no longer has its original inode proof. Never infer
-		// ownership from a public pathname or hash alone.
-		return removeLegacyJournalEntry(journal, index)
-	}
-
 	qExists, err := pathExists(qpath)
 	if err != nil {
 		return err
 	}
+	anchorExists, err := pathExists(anchor)
+	if err != nil {
+		return err
+	}
+
 	if qExists {
+		if !anchorExists {
+			// A prior attempt already moved data out of the public pathname but
+			// the private identity proof is gone. Preservation wins: restore the
+			// quarantined data rather than orphaning it.
+			journal.entries[index].state = legacyEntryRestore
+			if err := writeLegacyCleanupJournal(*journal); err != nil {
+				return fmt.Errorf("journal anchorless legacy snapshot restoration: %w", err)
+			}
+			return restoreLegacySnapshot(journal, index)
+		}
 		owned, err := snapshotFileStillOwned(qpath, anchor, entry.hash)
 		if err != nil {
 			return err
@@ -611,6 +613,12 @@ func cleanupPendingLegacySnapshot(journal *legacyCleanupJournal, index int) erro
 			return fmt.Errorf("journal ambiguous legacy snapshot restoration: %w", err)
 		}
 		return restoreLegacySnapshot(journal, index)
+	}
+
+	if !anchorExists {
+		// No destructive operation has occurred and the durable identity proof is
+		// gone. Never infer ownership from public bytes alone.
+		return removeLegacyJournalEntry(journal, index)
 	}
 
 	targetExists, err := pathExists(entry.path)
