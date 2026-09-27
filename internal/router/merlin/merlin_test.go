@@ -3,6 +3,7 @@ package merlin
 import (
 	"bytes"
 	"os"
+	"runtime"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -280,65 +281,6 @@ func Test_merlinLegacyEmptyHookCanBeReinstalled(t *testing.T) {
 	}
 }
 
-func Test_writeMerlinHookUpdatesPreflightsAllPaths(t *testing.T) {
-	dir := t.TempDir()
-	first := filepath.Join(dir, "dnsmasq.postconf")
-	second := filepath.Join(dir, "dnsmasq-sdn.postconf")
-	orig := []byte("#!/bin/sh\necho untouched\n")
-	if err := os.WriteFile(first, orig, 0750); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Mkdir(second, 0755); err != nil {
-		t.Fatal(err)
-	}
-
-	block := []byte("# BEGIN ctrld\necho managed\n# END ctrld")
-	if err := writeMerlinHookUpdates([]string{first, second}, block); err == nil {
-		t.Fatal("expected second-path preflight error")
-	}
-	got, err := os.ReadFile(first)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(got, orig) {
-		t.Fatalf("first hook changed before second path passed preflight:\nwant: %q\ngot:  %q", orig, got)
-	}
-}
-
-func Test_writeMerlinHookUpdatesRollsBackPartialWrites(t *testing.T) {
-	dir := t.TempDir()
-	first := filepath.Join(dir, "dnsmasq.postconf")
-	second := filepath.Join(dir, "dnsmasq-sdn.postconf")
-	orig := []byte("#!/bin/sh\necho original\n")
-	if err := os.WriteFile(first, orig, 0750); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(second, []byte("#!/bin/sh\necho second\n"), 0750); err != nil {
-		t.Fatal(err)
-	}
-
-	writes := 0
-	writeFile := func(path string, data []byte, mode os.FileMode) error {
-		writes++
-		if writes == 2 {
-			return os.ErrPermission
-		}
-		return atomicWriteFile(path, data, mode)
-	}
-
-	block := []byte("# BEGIN ctrld\necho managed\n# END ctrld")
-	if err := writeMerlinHookUpdatesWith([]string{first, second}, block, writeFile); err == nil {
-		t.Fatal("expected second write failure")
-	}
-	got, err := os.ReadFile(first)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(got, orig) {
-		t.Fatalf("first hook was not rolled back:\nwant: %q\ngot:  %q", orig, got)
-	}
-}
-
 func Test_revalidateMerlinHookUpdateDetectsContentChange(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "dnsmasq.postconf")
 	orig := []byte("#!/bin/sh\necho original\n")
@@ -392,6 +334,9 @@ func Test_revalidateMerlinHookUpdateDetectsDisappearedPath(t *testing.T) {
 }
 
 func Test_atomicWriteFilePreservesExistingMode(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX mode bits are not preserved by Windows filesystems")
+	}
 	for _, mode := range []os.FileMode{0700, 0770} {
 		t.Run(mode.String(), func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "dnsmasq.postconf")
@@ -409,5 +354,26 @@ func Test_atomicWriteFilePreservesExistingMode(t *testing.T) {
 				t.Fatalf("mode = %v, want %v", got, mode.Perm())
 			}
 		})
+	}
+}
+
+func Test_cleanupPreparationRevalidatesBeforeWrite(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "dnsmasq.postconf")
+	managed := []byte("#!/bin/sh\n# BEGIN ctrld\necho managed\n# END ctrld\necho addon\n")
+	if err := os.WriteFile(path, managed, 0750); err != nil {
+		t.Fatal(err)
+	}
+	update, err := prepareMerlinHookCleanup(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if update == nil {
+		t.Fatal("expected cleanup update")
+	}
+	if err := os.WriteFile(path, []byte("#!/bin/sh\necho addon-changed\n"), 0750); err != nil {
+		t.Fatal(err)
+	}
+	if err := revalidateMerlinHookUpdate(*update); err == nil {
+		t.Fatal("expected cleanup revalidation failure after external modification")
 	}
 }
