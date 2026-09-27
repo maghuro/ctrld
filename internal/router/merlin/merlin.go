@@ -634,137 +634,314 @@ func (m *Merlin) buildMainDnsmasqFallback(buf []byte) ([]byte, error) {
 	return built, nil
 }
 
+const (
+	snapshotPhasePending    = "pending-v2"
+	snapshotPhasePublished  = "published-v2"
+	snapshotPhaseQuarantine = "quarantine-v2"
+	snapshotPhaseDelete     = "delete-v2"
+	snapshotPhaseRestore    = "restore-v2"
+	snapshotPhaseRestored   = "restored-v2"
+)
+
+type mainSnapshotState struct {
+	phase string
+	hash  string
+}
+
 func merlinSnapshotHash(buf []byte) string {
 	sum := sha256.Sum256(buf)
 	return hex.EncodeToString(sum[:])
 }
 
-func readMainSnapshotHash() (string, bool, error) {
-	state, err := readMerlinState(merlinSnapshotStatePath)
-	if err != nil {
-		return "", false, err
+func writeMainSnapshotState(state mainSnapshotState) error {
+	if state.phase == "" {
+		return fmt.Errorf("empty Merlin snapshot phase")
 	}
-	if state == "" {
-		return "", false, nil
+	if len(state.hash) != sha256.Size*2 {
+		return fmt.Errorf("invalid Merlin snapshot hash length")
 	}
-	const prefix = "sha256="
-	if !strings.HasPrefix(state, prefix) || len(state) != len(prefix)+sha256.Size*2 {
-		return "", false, fmt.Errorf("invalid Merlin dnsmasq snapshot ownership state")
+	if _, err := hex.DecodeString(state.hash); err != nil {
+		return fmt.Errorf("invalid Merlin snapshot hash: %w", err)
 	}
-	hash := strings.TrimPrefix(state, prefix)
-	if _, err := hex.DecodeString(hash); err != nil {
-		return "", false, fmt.Errorf("invalid Merlin dnsmasq snapshot hash: %w", err)
-	}
-	return hash, true, nil
+	buf := []byte("snapshot-v2\nphase=" + state.phase + "\nsha256=" + state.hash + "\n")
+	return atomicWriteFile(merlinSnapshotStatePath, buf, 0600)
 }
 
-func mainSnapshotOwnership() (bool, error) {
-	expected, marked, err := readMainSnapshotHash()
-	if err != nil || !marked {
-		return false, err
-	}
-	buf, err := os.ReadFile(dnsmasq.MerlinJffsConfPath)
+func readMainSnapshotState() (mainSnapshotState, bool, error) {
+	buf, err := os.ReadFile(merlinSnapshotStatePath)
 	if os.IsNotExist(err) {
-		return false, nil
+		return mainSnapshotState{}, false, nil
 	}
+	if err != nil {
+		return mainSnapshotState{}, false, err
+	}
+	lines := strings.Split(strings.TrimSpace(string(buf)), "\n")
+
+	// No released ctrld version wrote this hash-only format. Reject it rather
+	// than guessing inode ownership if an intermediate development build left it.
+	if len(lines) == 1 && strings.HasPrefix(lines[0], "sha256=") {
+		return mainSnapshotState{}, true, fmt.Errorf(
+			"unsafe hash-only Merlin snapshot state requires manual reconciliation: %s",
+			merlinSnapshotStatePath,
+		)
+	}
+	if len(lines) != 3 || lines[0] != "snapshot-v2" ||
+		!strings.HasPrefix(lines[1], "phase=") ||
+		!strings.HasPrefix(lines[2], "sha256=") {
+		return mainSnapshotState{}, true, fmt.Errorf("invalid Merlin snapshot state")
+	}
+
+	state := mainSnapshotState{
+		phase: strings.TrimPrefix(lines[1], "phase="),
+		hash:  strings.TrimPrefix(lines[2], "sha256="),
+	}
+	switch state.phase {
+	case snapshotPhasePending, snapshotPhasePublished, snapshotPhaseQuarantine,
+		snapshotPhaseDelete, snapshotPhaseRestore, snapshotPhaseRestored:
+	default:
+		return mainSnapshotState{}, true, fmt.Errorf("unknown Merlin snapshot phase %q", state.phase)
+	}
+	if len(state.hash) != sha256.Size*2 {
+		return mainSnapshotState{}, true, fmt.Errorf("invalid Merlin snapshot hash length")
+	}
+	if _, err := hex.DecodeString(state.hash); err != nil {
+		return mainSnapshotState{}, true, fmt.Errorf("invalid Merlin snapshot hash: %w", err)
+	}
+	return state, true, nil
+}
+
+func sameFilePaths(a, b string) (bool, error) {
+	ai, err := os.Stat(a)
 	if err != nil {
 		return false, err
 	}
-	return merlinSnapshotHash(buf) == expected, nil
+	bi, err := os.Stat(b)
+	if err != nil {
+		return false, err
+	}
+	return os.SameFile(ai, bi), nil
 }
 
+func cleanupSnapshotPrivateState() error {
+	if err := removeFileDurable(merlinSnapshotAnchorPath); err != nil {
+		return fmt.Errorf("remove Merlin snapshot anchor: %w", err)
+	}
+	if err := removeFileDurable(merlinSnapshotStatePath); err != nil {
+		return fmt.Errorf("remove Merlin snapshot state: %w", err)
+	}
+	return nil
+}
+
+// cleanupOwnedMainSnapshot reconciles ctrld's fallback transaction without ever
+// deleting a pathname based on content alone. The anchor proves inode identity;
+// the quarantine phases make every move resumable after power loss.
 func cleanupOwnedMainSnapshot() error {
-	expected, marked, err := readMainSnapshotHash()
+	state, marked, err := readMainSnapshotState()
 	if err != nil {
 		return err
 	}
 	if !marked {
+		quarantineExists, err := pathExists(merlinSnapshotQuarantinePath)
+		if err != nil {
+			return err
+		}
+		if quarantineExists {
+			return fmt.Errorf(
+				"unjournaled Merlin fallback quarantine requires manual reconciliation: %s",
+				merlinSnapshotQuarantinePath,
+			)
+		}
+		// A private anchor without a journal can only precede public publication:
+		// publishMainSnapshot makes the journal durable before linking dnsmasq.conf.
+		if err := removeFileDurable(merlinSnapshotAnchorPath); err != nil {
+			return fmt.Errorf("remove orphaned Merlin snapshot anchor: %w", err)
+		}
 		return nil
 	}
 
-	removed, err := quarantineRemoveOwnedFile(dnsmasq.MerlinJffsConfPath, expected)
+	switch state.phase {
+	case snapshotPhasePending:
+		return cleanupPendingMainSnapshot(state)
+	case snapshotPhasePublished:
+		state.phase = snapshotPhaseQuarantine
+		if err := writeMainSnapshotState(state); err != nil {
+			return fmt.Errorf("journal Merlin fallback quarantine: %w", err)
+		}
+		return cleanupOwnedMainSnapshot()
+	case snapshotPhaseQuarantine:
+		return cleanupQuarantinedMainSnapshot(state)
+	case snapshotPhaseDelete:
+		return finalizeOwnedMainSnapshotDelete()
+	case snapshotPhaseRestore:
+		return restoreQuarantinedMainSnapshot(state)
+	case snapshotPhaseRestored:
+		return finalizeRestoredMainSnapshot()
+	default:
+		return fmt.Errorf("unknown Merlin snapshot phase %q", state.phase)
+	}
+}
+
+func cleanupPendingMainSnapshot(state mainSnapshotState) error {
+	anchorExists, err := pathExists(merlinSnapshotAnchorPath)
 	if err != nil {
 		return err
 	}
-	if !removed {
-		// No target exists. The marker is orphaned and can be removed.
-		return removeFileDurable(merlinSnapshotStatePath)
-	}
-	return removeFileDurable(merlinSnapshotStatePath)
-}
-
-// quarantineRemoveOwnedFile atomically moves path out of the public pathname,
-// then verifies the captured file before deleting it. This binds deletion to
-// the exact inode that was renamed, rather than to a pathname that another
-// addon/user could replace between a hash check and unlink.
-//
-// If the captured file is not ctrld-owned, it is restored with no-clobber
-// semantics. If another actor recreates path before restoration, both files are
-// preserved and an error identifies the quarantine location for recovery.
-func quarantineRemoveOwnedFile(path, expectedHash string) (bool, error) {
-	dir := filepath.Dir(path)
-	base := filepath.Base(path)
-	quarantineDir, err := os.MkdirTemp(dir, "."+base+".ctrld-quarantine-*")
+	targetExists, err := pathExists(dnsmasq.MerlinJffsConfPath)
 	if err != nil {
-		return false, err
-	}
-	quarantine := filepath.Join(quarantineDir, "snapshot")
-	cleanupDir := true
-	defer func() {
-		if cleanupDir {
-			_ = os.Remove(quarantineDir)
-		}
-	}()
-
-	if err := os.Rename(path, quarantine); err != nil {
-		if os.IsNotExist(err) {
-			return false, nil
-		}
-		return false, err
+		return err
 	}
 
-	buf, err := os.ReadFile(quarantine)
-	if err != nil {
-		cleanupDir = false
-		return true, fmt.Errorf("read quarantined Merlin fallback %s: %w", quarantine, err)
-	}
-	if merlinSnapshotHash(buf) != expectedHash {
-		// Restore only if nobody recreated the public pathname in the meantime.
-		if err := os.Link(quarantine, path); err != nil {
-			cleanupDir = false
-			return true, fmt.Errorf(
-				"refusing to remove modified Merlin dnsmasq fallback; preserved captured file at %s and could not restore %s: %w",
-				quarantine, path, err,
+	if !anchorExists {
+		// Without the private inode proof, never touch a public target.
+		if err := removeFileDurable(merlinSnapshotStatePath); err != nil {
+			return err
+		}
+		if targetExists {
+			return fmt.Errorf(
+				"Merlin fallback publication lost its ownership anchor; left %s untouched",
+				dnsmasq.MerlinJffsConfPath,
 			)
 		}
-		if err := os.Remove(quarantine); err != nil {
-			cleanupDir = false
-			return true, fmt.Errorf("restored modified Merlin fallback but could not remove quarantine %s: %w", quarantine, err)
-		}
-		if err := os.Remove(quarantineDir); err != nil {
-			cleanupDir = false
-			return true, err
-		}
-		cleanupDir = false
-		if err := syncParentDir(dir); err != nil {
-			return true, err
-		}
-		return true, fmt.Errorf("refusing to remove modified Merlin dnsmasq fallback: %s", path)
+		return nil
+	}
+	if !targetExists {
+		return cleanupSnapshotPrivateState()
 	}
 
-	if err := os.Remove(quarantine); err != nil {
-		cleanupDir = false
-		return true, fmt.Errorf("remove quarantined ctrld fallback %s: %w", quarantine, err)
+	same, err := sameFilePaths(dnsmasq.MerlinJffsConfPath, merlinSnapshotAnchorPath)
+	if err != nil {
+		return err
 	}
-	if err := os.Remove(quarantineDir); err != nil {
-		cleanupDir = false
-		return true, err
+	if !same {
+		// Publication lost a no-clobber race. The public file belongs to someone
+		// else regardless of whether its bytes happen to match ctrld's snapshot.
+		return cleanupSnapshotPrivateState()
 	}
-	cleanupDir = false
-	if err := syncParentDir(dir); err != nil {
-		return true, err
+
+	state.phase = snapshotPhasePublished
+	if err := writeMainSnapshotState(state); err != nil {
+		return fmt.Errorf("promote pending Merlin fallback ownership: %w", err)
 	}
-	return true, nil
+	return cleanupOwnedMainSnapshot()
+}
+
+func cleanupQuarantinedMainSnapshot(state mainSnapshotState) error {
+	quarantineExists, err := pathExists(merlinSnapshotQuarantinePath)
+	if err != nil {
+		return err
+	}
+	if !quarantineExists {
+		targetExists, err := pathExists(dnsmasq.MerlinJffsConfPath)
+		if err != nil {
+			return err
+		}
+		if !targetExists {
+			// Nothing remains at the public pathname. Drop only ctrld-private proof.
+			return cleanupSnapshotPrivateState()
+		}
+		if err := os.Rename(dnsmasq.MerlinJffsConfPath, merlinSnapshotQuarantinePath); err != nil {
+			if os.IsNotExist(err) {
+				return cleanupOwnedMainSnapshot()
+			}
+			return fmt.Errorf("quarantine Merlin fallback: %w", err)
+		}
+		if err := syncParentDir(dnsmasq.MerlinJffsConfDir); err != nil {
+			return fmt.Errorf("sync Merlin fallback quarantine: %w", err)
+		}
+	}
+
+	anchorExists, err := pathExists(merlinSnapshotAnchorPath)
+	if err != nil {
+		return err
+	}
+	if !anchorExists {
+		state.phase = snapshotPhaseRestore
+		if err := writeMainSnapshotState(state); err != nil {
+			return err
+		}
+		return cleanupOwnedMainSnapshot()
+	}
+
+	same, err := sameFilePaths(merlinSnapshotQuarantinePath, merlinSnapshotAnchorPath)
+	if err != nil {
+		return err
+	}
+	buf, err := os.ReadFile(merlinSnapshotQuarantinePath)
+	if err != nil {
+		return fmt.Errorf("read quarantined Merlin fallback: %w", err)
+	}
+	if same && merlinSnapshotHash(buf) == state.hash {
+		state.phase = snapshotPhaseDelete
+	} else {
+		// Different inode or changed bytes mean user/addon ownership may have
+		// superseded ctrld. Preserve and restore the captured file.
+		state.phase = snapshotPhaseRestore
+	}
+	if err := writeMainSnapshotState(state); err != nil {
+		return fmt.Errorf("advance Merlin fallback quarantine state: %w", err)
+	}
+	return cleanupOwnedMainSnapshot()
+}
+
+func finalizeOwnedMainSnapshotDelete() error {
+	if err := removeFileDurable(merlinSnapshotQuarantinePath); err != nil {
+		return fmt.Errorf("remove quarantined ctrld fallback: %w", err)
+	}
+	return cleanupSnapshotPrivateState()
+}
+
+func restoreQuarantinedMainSnapshot(state mainSnapshotState) error {
+	quarantineExists, err := pathExists(merlinSnapshotQuarantinePath)
+	if err != nil {
+		return err
+	}
+	if !quarantineExists {
+		return fmt.Errorf(
+			"Merlin fallback marked for restoration but quarantine is missing: %s",
+			merlinSnapshotQuarantinePath,
+		)
+	}
+
+	targetExists, err := pathExists(dnsmasq.MerlinJffsConfPath)
+	if err != nil {
+		return err
+	}
+	if targetExists {
+		same, err := sameFilePaths(dnsmasq.MerlinJffsConfPath, merlinSnapshotQuarantinePath)
+		if err != nil {
+			return err
+		}
+		if !same {
+			return fmt.Errorf(
+				"cannot restore captured Merlin fallback because %s was recreated; preserved capture at %s",
+				dnsmasq.MerlinJffsConfPath, merlinSnapshotQuarantinePath,
+			)
+		}
+	} else {
+		// Restore with no-clobber hard-link semantics. If another actor wins the
+		// pathname race, the quarantine remains durably journaled and untouched.
+		if err := os.Link(merlinSnapshotQuarantinePath, dnsmasq.MerlinJffsConfPath); err != nil {
+			return fmt.Errorf("restore quarantined Merlin fallback: %w", err)
+		}
+		if err := syncParentDir(dnsmasq.MerlinJffsConfDir); err != nil {
+			return fmt.Errorf("sync restored Merlin fallback: %w", err)
+		}
+	}
+
+	state.phase = snapshotPhaseRestored
+	if err := writeMainSnapshotState(state); err != nil {
+		return fmt.Errorf("journal restored Merlin fallback: %w", err)
+	}
+	return cleanupOwnedMainSnapshot()
+}
+
+func finalizeRestoredMainSnapshot() error {
+	// Restoration was durably recorded only after a public hard link existed.
+	// Therefore a retry never needs to infer ownership from the current target.
+	if err := removeFileDurable(merlinSnapshotQuarantinePath); err != nil {
+		return fmt.Errorf("remove restored Merlin fallback quarantine: %w", err)
+	}
+	return cleanupSnapshotPrivateState()
 }
 
 // cleanupDnsmasqJffs removes the JFFS configuration file specified in the given dnsmasqConfig, if it exists.
