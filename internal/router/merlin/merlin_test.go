@@ -13,10 +13,11 @@ import (
 func Test_merlinParsePostConf(t *testing.T) {
 	origContent := "# foo"
 	data := strings.Join([]string{
-		dnsmasq.MerlinPostConfTmpl,
-		"\n",
+		dnsmasq.CtrldMarker,
+		"#!/bin/sh",
+		"echo ctrld-legacy",
 		dnsmasq.MerlinPostConfMarker,
-		"\n",
+		"",
 	}, "\n")
 
 	tests := []struct {
