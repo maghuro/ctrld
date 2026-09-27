@@ -9,7 +9,6 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
-	"unicode"
 
 	"github.com/kardianos/service"
 
@@ -120,11 +119,6 @@ func (m *Merlin) Cleanup() error {
 		return nil // was restored, nothing to do.
 	}
 
-	// Restore old configs.
-	if err := nvram.Restore(nvramKvMap, nvram.CtrldSetupKey); err != nil {
-		return err
-	}
-
 	for _, path := range []string{dnsmasq.MerlinPostConfPath, dnsmasq.MerlinSdnPostConfPath} {
 		if err := cleanupDnsmasqPostconf(path); err != nil {
 			return err
@@ -136,6 +130,13 @@ func (m *Merlin) Cleanup() error {
 			return fmt.Errorf("failed to cleanup jffs dnsmasq: config: %s, error: %w", cfg.confPath, err)
 		}
 	}
+
+	// Restore NVRAM only after ctrld-owned artifacts are cleaned successfully.
+	// Keeping ctrld_setup set until this point makes a failed cleanup retryable.
+	if err := nvram.Restore(nvramKvMap, nvram.CtrldSetupKey); err != nil {
+		return err
+	}
+
 	// Restart dnsmasq service.
 	if err := restartDNSMasq(); err != nil {
 		return err
@@ -221,7 +222,7 @@ func (m *Merlin) writeDnsmasqPostconfFile(path string) error {
 		dnsmasq.MerlinPostConfEndMarker,
 	}, "\n")
 
-	return os.WriteFile(path, merlinUpsertPostConf(buf, []byte(block)), 0750)
+	return atomicWriteFile(path, merlinUpsertPostConf(buf, []byte(block)), 0750)
 }
 
 func cleanupDnsmasqPostconf(path string) error {
@@ -241,7 +242,7 @@ func cleanupDnsmasqPostconf(path string) error {
 		return nil
 	}
 
-	return os.WriteFile(path, clean, 0750)
+	return atomicWriteFile(path, clean, 0750)
 }
 
 // restartDNSMasq restarts the dnsmasq service by executing the appropriate system command using "service".
@@ -266,43 +267,62 @@ func getDnsmasqConfigs() []*dnsmasqConfig {
 	return cfgs
 }
 
-// merlinParsePostConf removes ctrld-owned postconf content while preserving unrelated hook logic.
-// It understands both the current BEGIN/END block and the legacy ctrld <= 1.5.7 EOF marker format.
+// merlinPostConfBlock returns the ctrld-owned block bounds.
+// It understands both the current BEGIN/END format and the legacy <= 1.5.7
+// GENERATED/EOF format. Legacy matching is deliberately bounded by the known
+// ctrld header so content prepended by another addon is not treated as ours.
+func merlinPostConfBlock(buf []byte) (start, end int, ok bool) {
+	begin := []byte(dnsmasq.MerlinPostConfBeginMarker)
+	endMarker := []byte(dnsmasq.MerlinPostConfEndMarker)
+	if start = bytes.Index(buf, begin); start >= 0 {
+		relEnd := bytes.Index(buf[start+len(begin):], endMarker)
+		if relEnd >= 0 {
+			end = start + len(begin) + relEnd + len(endMarker)
+			return start, end, true
+		}
+	}
+
+	legacyEnd := []byte(dnsmasq.MerlinPostConfMarker)
+	if marker := bytes.Index(buf, legacyEnd); marker >= 0 {
+		legacyBegin := []byte(dnsmasq.CtrldMarker)
+		if relStart := bytes.LastIndex(buf[:marker], legacyBegin); relStart >= 0 {
+			return relStart, marker + len(legacyEnd), true
+		}
+	}
+
+	return 0, 0, false
+}
+
+// merlinParsePostConf removes only ctrld-owned postconf content while preserving
+// unrelated hook logic before and after it.
 func merlinParsePostConf(buf []byte) []byte {
 	if len(buf) == 0 {
 		return nil
 	}
-
-	begin := []byte(dnsmasq.MerlinPostConfBeginMarker)
-	end := []byte(dnsmasq.MerlinPostConfEndMarker)
-	if start := bytes.Index(buf, begin); start >= 0 {
-		if relEnd := bytes.Index(buf[start+len(begin):], end); relEnd >= 0 {
-			finish := start + len(begin) + relEnd + len(end)
-			for finish < len(buf) && (buf[finish] == '\r' || buf[finish] == '\n') {
-				finish++
-			}
-			out := make([]byte, 0, len(buf)-(finish-start))
-			out = append(out, buf[:start]...)
-			out = append(out, buf[finish:]...)
-			return bytes.TrimRight(out, "\r\n")
-		}
+	start, end, ok := merlinPostConfBlock(buf)
+	if !ok {
+		return buf
 	}
 
-	// Legacy format put the ctrld-generated script before an EOF marker and
-	// preserved the previous hook content after that marker.
-	parts := bytes.SplitN(buf, []byte(dnsmasq.MerlinPostConfMarker), 2)
-	if len(parts) == 2 {
-		return bytes.TrimLeftFunc(parts[1], unicode.IsSpace)
-	}
-	return buf
+	out := make([]byte, 0, len(buf)-(end-start))
+	out = append(out, buf[:start]...)
+	out = append(out, buf[end:]...)
+	return bytes.TrimRight(out, "\r\n")
 }
 
-// merlinUpsertPostConf replaces only ctrld's marked block and keeps other hook content.
-// ctrld's block is inserted immediately after an existing shebang, otherwise a shell shebang is added.
+// merlinUpsertPostConf replaces an existing ctrld block in place, preserving
+// ordering relative to other addons. On first install, it places ctrld directly
+// after an existing shebang, or creates a shell shebang if one is absent.
 func merlinUpsertPostConf(buf, block []byte) []byte {
-	clean := merlinParsePostConf(buf)
-	clean = bytes.TrimRight(clean, "\r\n")
+	if start, end, ok := merlinPostConfBlock(buf); ok {
+		out := make([]byte, 0, len(buf)-(end-start)+len(block))
+		out = append(out, buf[:start]...)
+		out = append(out, block...)
+		out = append(out, buf[end:]...)
+		return out
+	}
 
+	clean := bytes.TrimRight(buf, "\r\n")
 	if len(clean) == 0 {
 		return []byte("#!/bin/sh\n\n" + string(block) + "\n")
 	}
@@ -310,13 +330,13 @@ func merlinUpsertPostConf(buf, block []byte) []byte {
 	if bytes.HasPrefix(clean, []byte("#!")) {
 		if nl := bytes.IndexByte(clean, '\n'); nl >= 0 {
 			head := clean[:nl+1]
-			rest := bytes.TrimLeft(clean[nl+1:], "\r\n")
+			rest := clean[nl+1:]
 			out := make([]byte, 0, len(clean)+len(block)+4)
 			out = append(out, head...)
 			out = append(out, '\n')
 			out = append(out, block...)
 			if len(rest) > 0 {
-				out = append(out, '\n', '\n')
+				out = append(out, '\n')
 				out = append(out, rest...)
 			}
 			out = append(out, '\n')
@@ -325,6 +345,42 @@ func merlinUpsertPostConf(buf, block []byte) []byte {
 	}
 
 	return []byte("#!/bin/sh\n\n" + string(block) + "\n\n" + string(clean) + "\n")
+}
+
+// atomicWriteFile replaces path only after a complete sibling temporary file
+// has been written, synced, closed and chmodded. This avoids truncating a shared
+// Merlin hook if JFFS fills up or a short write occurs.
+func atomicWriteFile(path string, data []byte, mode os.FileMode) (err error) {
+	dir := filepath.Dir(path)
+	base := filepath.Base(path)
+	tmp, err := os.CreateTemp(dir, "."+base+".ctrld-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer func() {
+		_ = tmp.Close()
+		if err != nil {
+			_ = os.Remove(tmpName)
+		}
+	}()
+
+	if err = tmp.Chmod(mode); err != nil {
+		return err
+	}
+	if _, err = tmp.Write(data); err != nil {
+		return err
+	}
+	if err = tmp.Sync(); err != nil {
+		return err
+	}
+	if err = tmp.Close(); err != nil {
+		return err
+	}
+	if err = os.Rename(tmpName, path); err != nil {
+		return err
+	}
+	return nil
 }
 
 // waitDirExists waits until the specified directory exists, polling its existence every second.
