@@ -53,7 +53,7 @@ case "$pid" in
   ''|*[!0-9]*) ;;
   *)
     if [ -r "/proc/${pid}/cmdline" ]; then
-      ctrld_cmd=$(tr '\\000' '\\n' < "/proc/${pid}/cmdline" 2>/dev/null | sed -n '1p')
+      ctrld_cmd=$(tr '\000' '\n' < "/proc/${pid}/cmdline" 2>/dev/null | sed -n '1p')
     fi
     ;;
 esac
