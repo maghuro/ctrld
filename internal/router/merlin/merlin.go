@@ -501,35 +501,21 @@ func (m *Merlin) dnsmasqConfigUsesCtrld(path string) (bool, error) {
 
 // setupMainDnsmasqFallback retains the old full-config mechanism only for the
 // main dnsmasq when the supported postconf hook demonstrably did not apply.
-// Ownership is published before the final snapshot, and content hashes prevent
-// ctrld from later deleting or overwriting a user-modified file.
+// Ownership is represented by a private hard-link anchor to the exact inode
+// ctrld published, plus a durable phase/hash journal.
 func (m *Merlin) setupMainDnsmasqFallback() error {
-	owned, err := mainSnapshotOwnership()
-	if err != nil {
+	// Reconcile any interrupted ctrld fallback transaction first. Private ctrld
+	// artifacts are handled without inferring ownership from public-path bytes.
+	if err := cleanupOwnedMainSnapshot(); err != nil {
 		return err
 	}
+
 	snapshotExists, err := pathExists(dnsmasq.MerlinJffsConfPath)
 	if err != nil {
 		return fmt.Errorf("stat Merlin fallback config: %w", err)
 	}
 	if snapshotExists {
-		if !owned {
-			return fmt.Errorf("refusing to overwrite unowned or modified Merlin custom config: %s", dnsmasq.MerlinJffsConfPath)
-		}
-		if err := cleanupOwnedMainSnapshot(); err != nil {
-			return err
-		}
-	} else {
-		stateExists, err := pathExists(merlinSnapshotStatePath)
-		if err != nil {
-			return fmt.Errorf("stat Merlin fallback ownership: %w", err)
-		}
-		if stateExists {
-			// A previous crash may have published ownership before the snapshot.
-			if err := removeFileDurable(merlinSnapshotStatePath); err != nil {
-				return fmt.Errorf("remove orphaned Merlin snapshot state: %w", err)
-			}
-		}
+		return fmt.Errorf("refusing to overwrite unowned Merlin custom config: %s", dnsmasq.MerlinJffsConfPath)
 	}
 
 	buf, err := os.ReadFile(dnsmasq.MerlinConfPath)
@@ -540,83 +526,74 @@ func (m *Merlin) setupMainDnsmasqFallback() error {
 	if err != nil {
 		return err
 	}
-	hash := merlinSnapshotHash(built)
-
-	// Publish durable ownership first. If the router stops before the snapshot
-	// rename, cleanup sees a harmless orphaned marker and removes it.
-	if err := atomicWriteFile(merlinSnapshotStatePath, []byte("sha256="+hash+"\n"), 0600); err != nil {
-		return fmt.Errorf("mark ctrld dnsmasq fallback ownership: %w", err)
-	}
-	// Publish without replacement semantics. Between the earlier ownership
-	// check and this point an administrator/addon may legitimately create a new
-	// dnsmasq.conf; ctrld must never clobber that concurrently-created file.
-	published, err := writeFileNoReplace(dnsmasq.MerlinJffsConfPath, built, 0644)
-	if err != nil {
-		if !published {
-			// No link to the target was created by ctrld. Even if another actor
-			// concurrently created byte-identical content, ctrld must not infer
-			// ownership from bytes alone.
-			if removeErr := removeFileDurable(merlinSnapshotStatePath); removeErr != nil {
-				return fmt.Errorf("publish ctrld dnsmasq fallback: %w; remove ownership state: %v", err, removeErr)
-			}
-		}
-		// If published is true, the no-replace link succeeded and only a
-		// post-publication cleanup/sync step failed. Retain ownership so Cleanup
-		// can reconcile the exact published snapshot safely.
+	if err := publishMainSnapshot(built, 0644); err != nil {
 		return fmt.Errorf("publish ctrld dnsmasq fallback: %w", err)
 	}
 	return nil
 }
 
-// writeFileNoReplace publishes target only if it does not already exist.
-// published reports whether ctrld's inode was successfully linked at target;
-// callers must not infer ownership from target contents when published is false.
-func writeFileNoReplace(target string, data []byte, mode os.FileMode) (published bool, err error) {
-	dir := filepath.Dir(target)
-	base := filepath.Base(target)
-	tmp, err := os.CreateTemp(dir, "."+base+".ctrld-noreplace-*")
+// publishMainSnapshot publishes ctrld's fallback with identity-based ownership.
+//
+// The private anchor is a hard link to the exact inode prepared by ctrld. A
+// pending journal is made durable before the public hard link is attempted, so
+// cleanup can distinguish a failed no-clobber publication from a ctrld-owned
+// target even after power loss.
+func publishMainSnapshot(data []byte, mode os.FileMode) error {
+	dir := dnsmasq.MerlinJffsConfDir
+	base := filepath.Base(dnsmasq.MerlinJffsConfPath)
+	tmp, err := os.CreateTemp(dir, "."+base+".ctrld-publish-*")
 	if err != nil {
-		return false, err
+		return err
 	}
 	tmpPath := tmp.Name()
-	cleanup := true
-	defer func() {
-		_ = tmp.Close()
-		if cleanup {
-			_ = os.Remove(tmpPath)
-		}
-	}()
+	defer os.Remove(tmpPath)
 
 	if err := tmp.Chmod(mode); err != nil {
-		return false, err
+		_ = tmp.Close()
+		return err
 	}
 	if _, err := tmp.Write(data); err != nil {
-		return false, err
+		_ = tmp.Close()
+		return err
 	}
 	if err := tmp.Sync(); err != nil {
-		return false, err
+		_ = tmp.Close()
+		return err
 	}
 	if err := tmp.Close(); err != nil {
-		return false, err
+		return err
 	}
 
-	// link(2) is atomic with respect to target existence and never replaces an
-	// existing pathname. The temporary file lives in the same directory/filesystem.
-	if err := os.Link(tmpPath, target); err != nil {
-		return false, err
+	// The anchor must be created before the journal/public link. It gives
+	// cleanup an inode identity that hashes alone cannot provide.
+	if err := os.Link(tmpPath, merlinSnapshotAnchorPath); err != nil {
+		return fmt.Errorf("create fallback ownership anchor: %w", err)
 	}
-	published = true
-	if err := os.Remove(tmpPath); err != nil {
-		// The target is already published and valid; report the failure with
-		// published=true so the caller retains ownership state.
-		cleanup = false
-		return true, err
-	}
-	cleanup = false
 	if err := syncParentDir(dir); err != nil {
-		return true, err
+		return fmt.Errorf("sync fallback ownership anchor: %w", err)
 	}
-	return true, nil
+
+	state := mainSnapshotState{phase: snapshotPhasePending, hash: merlinSnapshotHash(data)}
+	if err := writeMainSnapshotState(state); err != nil {
+		return fmt.Errorf("journal pending fallback publication: %w", err)
+	}
+
+	// Hard-link publication is atomic and no-clobber: a concurrent user/addon
+	// file at dnsmasq.conf causes EEXIST rather than replacement.
+	if err := os.Link(tmpPath, dnsmasq.MerlinJffsConfPath); err != nil {
+		return err
+	}
+	if err := syncParentDir(dir); err != nil {
+		return fmt.Errorf("sync published fallback: %w", err)
+	}
+
+	state.phase = snapshotPhasePublished
+	if err := writeMainSnapshotState(state); err != nil {
+		// Pending state plus the anchor is sufficient for cleanup to prove that
+		// the public inode is ours, so this remains safely retryable.
+		return fmt.Errorf("journal published fallback: %w", err)
+	}
+	return nil
 }
 
 func (m *Merlin) buildMainDnsmasqFallback(buf []byte) ([]byte, error) {
