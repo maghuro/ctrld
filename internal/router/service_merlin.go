@@ -104,6 +104,12 @@ func (s *merlinSvc) Install() error {
 	if err := os.WriteFile(confPath, rendered.Bytes(), 0755); err != nil {
 		return fmt.Errorf("os.WriteFile: startup script: %w", err)
 	}
+	installComplete := false
+	defer func() {
+		if !installComplete {
+			_ = os.Remove(confPath)
+		}
+	}()
 
 	if err := os.MkdirAll(filepath.Dir(merlinJFFSScriptPath), 0755); err != nil {
 		return fmt.Errorf("os.MkdirAll: %w", err)
@@ -122,47 +128,61 @@ func (s *merlinSvc) Install() error {
 	if err := tmpScript.Close(); err != nil {
 		return fmt.Errorf("tmpScript.Close: %w", err)
 	}
-	addLineToScript := func(line, script string) error {
+	addLineToScript := func(line, script string) (created bool, retErr error) {
 		if _, err := os.Stat(script); os.IsNotExist(err) {
 			if err := os.WriteFile(script, []byte("#!/bin/sh\n"), 0755); err != nil {
-				return err
+				return false, err
 			}
+			created = true
 		} else if err != nil {
-			return err
+			return false, err
 		}
+		defer func() {
+			if retErr != nil && created {
+				_ = os.Remove(script)
+			}
+		}()
 		if err := os.Chmod(script, 0755); err != nil {
-			return fmt.Errorf("os.Chmod: jffs script: %w", err)
+			return created, fmt.Errorf("os.Chmod: jffs script: %w", err)
 		}
 
 		if err := exec.Command("sh", tmpScript.Name(), line, script, "add").Run(); err != nil {
-			return fmt.Errorf("exec.Command: add startup script: %w", err)
+			return created, fmt.Errorf("exec.Command: add startup script: %w", err)
 		}
-		return nil
+		return created, nil
 	}
 
 	type hookLine struct {
-		script string
-		line   string
+		script  string
+		line    string
+		created bool
 	}
 	hooks := []hookLine{
-		{merlinJFFSScriptPath, s.configPath() + " start"},
-		{merlinJFFSServiceEventScriptPath, s.configPath() + ` service_event "$1" "$2"`},
+		{script: merlinJFFSScriptPath, line: s.configPath() + " start"},
+		{script: merlinJFFSServiceEventScriptPath, line: s.configPath() + ` service_event "$1" "$2"`},
 	}
 	installed := make([]hookLine, 0, len(hooks))
 	for _, hook := range hooks {
-		if err := addLineToScript(hook.line, hook.script); err != nil {
+		created, err := addLineToScript(hook.line, hook.script)
+		if err != nil {
 			// Best-effort rollback: remove only lines successfully installed by
-			// this attempt, then remove the startup script so a retry can start
-			// from a clean state.
+			// this attempt. Shared hook files created by ctrld are removed again;
+			// pre-existing hooks keep all unrelated content.
 			for i := len(installed) - 1; i >= 0; i-- {
-				_ = exec.Command("sh", tmpScript.Name(), installed[i].line, installed[i].script, "remove").Run()
+				prev := installed[i]
+				if prev.created {
+					_ = os.Remove(prev.script)
+					continue
+				}
+				_ = exec.Command("sh", tmpScript.Name(), prev.line, prev.script, "remove").Run()
 			}
-			_ = os.Remove(confPath)
 			return err
 		}
+		hook.created = created
 		installed = append(installed, hook)
 	}
 
+	installComplete = true
 	return nil
 }
 
