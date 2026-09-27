@@ -245,3 +245,15 @@ func TestMerlinStartupHookLinesQuoteConfigPath(t *testing.T) {
 		t.Fatalf("service-event hook = %q", event)
 	}
 }
+
+
+func TestMerlinLegacyStartupHookLinesRemainRemovable(t *testing.T) {
+	path := "/jffs/controld/ctrld.startup"
+	start, event := merlinLegacyStartupHookLines(path)
+	if start != path+" start" {
+		t.Fatalf("legacy start hook = %q", start)
+	}
+	if event != path+` service_event "$1" "$2"` {
+		t.Fatalf("legacy service-event hook = %q", event)
+	}
+}
