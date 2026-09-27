@@ -1,0 +1,63 @@
+//go:build linux
+
+package router
+
+import (
+	"bytes"
+	"fmt"
+	"io"
+	"os"
+
+	"golang.org/x/sys/unix"
+)
+
+func prepareExistingMerlinStartupScript(path string, expected []byte) (exists bool, retErr error) {
+	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
+	if err != nil {
+		if err == unix.ENOENT {
+			return false, nil
+		}
+		if err == unix.ELOOP {
+			return true, fmt.Errorf("startup script is not a regular file: %s", path)
+		}
+		return false, err
+	}
+
+	f := os.NewFile(uintptr(fd), path)
+	if f == nil {
+		_ = unix.Close(fd)
+		return true, fmt.Errorf("could not wrap startup script descriptor: %s", path)
+	}
+	defer func() {
+		if err := f.Close(); retErr == nil && err != nil {
+			retErr = err
+		}
+	}()
+
+	info, err := f.Stat()
+	if err != nil {
+		return true, err
+	}
+	if !info.Mode().IsRegular() {
+		return true, fmt.Errorf("startup script is not a regular file: %s", path)
+	}
+
+	got, err := io.ReadAll(f)
+	if err != nil {
+		return true, err
+	}
+	if !bytes.Equal(got, expected) {
+		return true, fmt.Errorf("already installed with different startup script: %s", path)
+	}
+
+	// Keep validation, content comparison and chmod pinned to the same inode.
+	// O_NOFOLLOW prevents a pathname race from redirecting any of these
+	// privileged operations through a symlink.
+	if err := f.Chmod(0755); err != nil {
+		return true, err
+	}
+	if err := f.Sync(); err != nil {
+		return true, err
+	}
+	return true, nil
+}
