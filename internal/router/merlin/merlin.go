@@ -125,13 +125,10 @@ func (m *Merlin) Cleanup() error {
 		return err
 	}
 
-	buf, err := os.ReadFile(dnsmasq.MerlinPostConfPath)
-	if err != nil && !os.IsNotExist(err) {
-		return err
-	}
-	// Restore dnsmasq post conf file.
-	if err := os.WriteFile(dnsmasq.MerlinPostConfPath, merlinParsePostConf(buf), 0750); err != nil {
-		return err
+	for _, path := range []string{dnsmasq.MerlinPostConfPath, dnsmasq.MerlinSdnPostConfPath} {
+		if err := cleanupDnsmasqPostconf(path); err != nil {
+			return err
+		}
 	}
 
 	for _, cfg := range getDnsmasqConfigs() {
@@ -176,8 +173,12 @@ func (m *Merlin) setupDnsmasq(cfg *dnsmasqConfig) error {
 		return fmt.Errorf("failed to save %s: %w", cfg.jffsConfPath, err)
 	}
 
-	// Run postconf script on cfg.jffsConfPath directly.
-	cmd := exec.Command("/bin/sh", dnsmasq.MerlinPostConfPath, cfg.jffsConfPath)
+	// Run the appropriate postconf script on cfg.jffsConfPath directly.
+	postConfPath := dnsmasq.MerlinPostConfPath
+	if cfg.confPath != dnsmasq.MerlinConfPath {
+		postConfPath = dnsmasq.MerlinSdnPostConfPath
+	}
+	cmd := exec.Command("/bin/sh", postConfPath, cfg.jffsConfPath)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("failed to run post conf: %s: %w", string(out), err)
 	}
@@ -193,13 +194,18 @@ func (m *Merlin) cleanupDnsmasqJffs(cfg *dnsmasqConfig) error {
 	return nil
 }
 
-// writeDnsmasqPostconf writes the requireddnsmasqConfigs post-configuration for dnsmasq to enable custom DNS settings with ctrld.
+// writeDnsmasqPostconf installs ctrld-owned blocks in Merlin's main and SDN hooks while preserving unrelated content.
 func (m *Merlin) writeDnsmasqPostconf() error {
-	buf, err := os.ReadFile(dnsmasq.MerlinPostConfPath)
-	// Already setup.
-	if bytes.Contains(buf, []byte(dnsmasq.MerlinPostConfMarker)) {
-		return nil
+	for _, path := range []string{dnsmasq.MerlinPostConfPath, dnsmasq.MerlinSdnPostConfPath} {
+		if err := m.writeDnsmasqPostconfFile(path); err != nil {
+			return err
+		}
 	}
+	return nil
+}
+
+func (m *Merlin) writeDnsmasqPostconfFile(path string) error {
+	buf, err := os.ReadFile(path)
 	if err != nil && !os.IsNotExist(err) {
 		return err
 	}
@@ -208,15 +214,34 @@ func (m *Merlin) writeDnsmasqPostconf() error {
 	if err != nil {
 		return err
 	}
-	data = strings.Join([]string{
-		data,
-		"\n",
-		dnsmasq.MerlinPostConfMarker,
-		"\n",
-		string(buf),
+
+	block := strings.Join([]string{
+		dnsmasq.MerlinPostConfBeginMarker,
+		strings.TrimSpace(data),
+		dnsmasq.MerlinPostConfEndMarker,
 	}, "\n")
-	// Write dnsmasq post conf file.
-	return os.WriteFile(dnsmasq.MerlinPostConfPath, []byte(data), 0750)
+
+	return os.WriteFile(path, merlinUpsertPostConf(buf, []byte(block)), 0750)
+}
+
+func cleanupDnsmasqPostconf(path string) error {
+	buf, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+
+	clean := merlinParsePostConf(buf)
+	if len(bytes.TrimSpace(clean)) == 0 || bytes.Equal(bytes.TrimSpace(clean), []byte("#!/bin/sh")) {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		return nil
+	}
+
+	return os.WriteFile(path, clean, 0750)
 }
 
 // restartDNSMasq restarts the dnsmasq service by executing the appropriate system command using "service".
@@ -241,18 +266,65 @@ func getDnsmasqConfigs() []*dnsmasqConfig {
 	return cfgs
 }
 
-// merlinParsePostConf parses the dnsmasq post configuration by removing content after the MerlinPostConfMarker, if present.
-// If no marker is found, the original buffer is returned unmodified.
-// Returns nil if the input buffer is empty.
+// merlinParsePostConf removes ctrld-owned postconf content while preserving unrelated hook logic.
+// It understands both the current BEGIN/END block and the legacy ctrld <= 1.5.7 EOF marker format.
 func merlinParsePostConf(buf []byte) []byte {
 	if len(buf) == 0 {
 		return nil
 	}
-	parts := bytes.Split(buf, []byte(dnsmasq.MerlinPostConfMarker))
-	if len(parts) != 1 {
+
+	begin := []byte(dnsmasq.MerlinPostConfBeginMarker)
+	end := []byte(dnsmasq.MerlinPostConfEndMarker)
+	if start := bytes.Index(buf, begin); start >= 0 {
+		if relEnd := bytes.Index(buf[start+len(begin):], end); relEnd >= 0 {
+			finish := start + len(begin) + relEnd + len(end)
+			for finish < len(buf) && (buf[finish] == '\r' || buf[finish] == '\n') {
+				finish++
+			}
+			out := make([]byte, 0, len(buf)-(finish-start))
+			out = append(out, buf[:start]...)
+			out = append(out, buf[finish:]...)
+			return bytes.TrimRight(out, "\r\n")
+		}
+	}
+
+	// Legacy format put the ctrld-generated script before an EOF marker and
+	// preserved the previous hook content after that marker.
+	parts := bytes.SplitN(buf, []byte(dnsmasq.MerlinPostConfMarker), 2)
+	if len(parts) == 2 {
 		return bytes.TrimLeftFunc(parts[1], unicode.IsSpace)
 	}
 	return buf
+}
+
+// merlinUpsertPostConf replaces only ctrld's marked block and keeps other hook content.
+// ctrld's block is inserted immediately after an existing shebang, otherwise a shell shebang is added.
+func merlinUpsertPostConf(buf, block []byte) []byte {
+	clean := merlinParsePostConf(buf)
+	clean = bytes.TrimRight(clean, "\r\n")
+
+	if len(clean) == 0 {
+		return []byte("#!/bin/sh\n\n" + string(block) + "\n")
+	}
+
+	if bytes.HasPrefix(clean, []byte("#!")) {
+		if nl := bytes.IndexByte(clean, '\n'); nl >= 0 {
+			head := clean[:nl+1]
+			rest := bytes.TrimLeft(clean[nl+1:], "\r\n")
+			out := make([]byte, 0, len(clean)+len(block)+4)
+			out = append(out, head...)
+			out = append(out, '\n')
+			out = append(out, block...)
+			if len(rest) > 0 {
+				out = append(out, '\n', '\n')
+				out = append(out, rest...)
+			}
+			out = append(out, '\n')
+			return out
+		}
+	}
+
+	return []byte("#!/bin/sh\n\n" + string(block) + "\n\n" + string(clean) + "\n")
 }
 
 // waitDirExists waits until the specified directory exists, polling its existence every second.
