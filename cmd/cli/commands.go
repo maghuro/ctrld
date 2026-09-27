@@ -758,7 +758,8 @@ func initRestartCmd() *cobra.Command {
 						for {
 							select {
 							case <-ctx.Done():
-								return fmt.Errorf("timeout while waiting for service to stop")
+								mainLog.Load().Error().Msg("timeout while waiting for service to stop")
+								return nil
 							default:
 							}
 							if status, _ := s.Status(); status == service.StatusStopped {
@@ -1306,7 +1307,8 @@ func initUpgradeCmd() *cobra.Command {
 						for {
 							select {
 							case <-ctx.Done():
-								return fmt.Errorf("timeout while waiting for service to stop")
+								mainLog.Load().Error().Msg("timeout while waiting for service to stop")
+								return nil
 							default:
 							}
 							if status, _ := s.Status(); status == service.StatusStopped {
