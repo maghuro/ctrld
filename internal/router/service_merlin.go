@@ -70,6 +70,56 @@ func merlinShellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'"
 }
 
+func writeMerlinStartupScript(path string, data []byte, mode os.FileMode) (published bool, retErr error) {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".ctrld-*")
+	if err != nil {
+		return false, err
+	}
+	tmpPath := tmp.Name()
+	defer func() {
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
+	}()
+
+	if err := tmp.Chmod(mode); err != nil {
+		return false, err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		return false, err
+	}
+	if err := tmp.Sync(); err != nil {
+		return false, err
+	}
+	if err := tmp.Close(); err != nil {
+		return false, err
+	}
+
+	// Publish without replacement semantics. If another actor creates the
+	// startup script after our preflight, leave that file untouched.
+	if err := os.Link(tmpPath, path); err != nil {
+		return false, err
+	}
+	published = true
+
+	if err := os.Remove(tmpPath); err != nil {
+		return true, err
+	}
+	if err := syncMerlinServiceDir(dir); err != nil {
+		return true, err
+	}
+	return true, nil
+}
+
+func syncMerlinServiceDir(dir string) error {
+	f, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return f.Sync()
+}
+
 func (s *merlinSvc) Install() error {
 	exePath, err := os.Executable()
 	if err != nil {
@@ -107,13 +157,19 @@ func (s *merlinSvc) Install() error {
 	if err := s.template().Execute(&rendered, to); err != nil {
 		return fmt.Errorf("s.template.Execute: %w", err)
 	}
-	if err := os.WriteFile(confPath, rendered.Bytes(), 0755); err != nil {
-		return fmt.Errorf("os.WriteFile: startup script: %w", err)
+	startupPublished, err := writeMerlinStartupScript(confPath, rendered.Bytes(), 0755)
+	if err != nil {
+		if startupPublished {
+			_ = os.Remove(confPath)
+			_ = syncMerlinServiceDir(filepath.Dir(confPath))
+		}
+		return fmt.Errorf("publish startup script: %w", err)
 	}
 	installComplete := false
 	defer func() {
 		if !installComplete {
 			_ = os.Remove(confPath)
+			_ = syncMerlinServiceDir(filepath.Dir(confPath))
 		}
 	}()
 
