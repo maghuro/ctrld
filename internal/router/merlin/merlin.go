@@ -237,6 +237,9 @@ func (m *Merlin) Cleanup() error {
 			return err
 		}
 		if err := writeLegacyCleanupJournal(journal); err != nil {
+			if cleanupErr := cleanupLegacyCaptureAnchors(journal); cleanupErr != nil {
+				return fmt.Errorf("journal legacy dnsmasq snapshots: %w; cleanup captured anchors: %v", err, cleanupErr)
+			}
 			return fmt.Errorf("journal legacy dnsmasq snapshots: %w", err)
 		}
 	}
@@ -289,6 +292,15 @@ func legacySnapshotAnchorPath(path string) string {
 func removeLegacySnapshotAnchor(path string) error {
 	if err := removeFileDurable(legacySnapshotAnchorPath(path)); err != nil {
 		return fmt.Errorf("remove legacy snapshot anchor for %s: %w", path, err)
+	}
+	return nil
+}
+
+func cleanupLegacyCaptureAnchors(journal legacyCleanupJournal) error {
+	for _, entry := range journal.entries {
+		if err := removeLegacySnapshotAnchor(entry.path); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -566,12 +578,34 @@ func cleanupLegacySnapshots(journal *legacyCleanupJournal) error {
 func cleanupPendingLegacySnapshot(journal *legacyCleanupJournal, index int) error {
 	entry := journal.entries[index]
 	qpath := legacySnapshotQuarantinePath(entry.path)
+	anchor := legacySnapshotAnchorPath(entry.path)
+
+	anchorExists, err := pathExists(anchor)
+	if err != nil {
+		return err
+	}
+	if !anchorExists {
+		// The durable journal no longer has its original inode proof. Never infer
+		// ownership from a public pathname or hash alone.
+		return removeLegacyJournalEntry(journal, index)
+	}
 
 	qExists, err := pathExists(qpath)
 	if err != nil {
 		return err
 	}
 	if qExists {
+		owned, err := snapshotFileStillOwned(qpath, anchor, entry.hash)
+		if err != nil {
+			return err
+		}
+		if owned {
+			journal.entries[index].state = legacyEntryDelete
+			if err := writeLegacyCleanupJournal(*journal); err != nil {
+				return fmt.Errorf("journal quarantined legacy snapshot deletion: %w", err)
+			}
+			return finalizeLegacySnapshotDelete(journal, index)
+		}
 		journal.entries[index].state = legacyEntryRestore
 		if err := writeLegacyCleanupJournal(*journal); err != nil {
 			return fmt.Errorf("journal ambiguous legacy snapshot restoration: %w", err)
@@ -579,35 +613,33 @@ func cleanupPendingLegacySnapshot(journal *legacyCleanupJournal, index int) erro
 		return restoreLegacySnapshot(journal, index)
 	}
 
-	f, err := os.Open(entry.path)
-	if os.IsNotExist(err) {
+	targetExists, err := pathExists(entry.path)
+	if err != nil {
+		return err
+	}
+	if !targetExists {
+		if err := removeLegacySnapshotAnchor(entry.path); err != nil {
+			return err
+		}
 		return removeLegacyJournalEntry(journal, index)
 	}
+
+	owned, err := snapshotFileStillOwned(entry.path, anchor, entry.hash)
 	if err != nil {
-		return fmt.Errorf("open journaled legacy snapshot %s: %w", entry.path, err)
+		return err
 	}
-	info, err := f.Stat()
-	if err != nil {
-		_ = f.Close()
-		return fmt.Errorf("stat journaled legacy snapshot %s: %w", entry.path, err)
-	}
-	buf, err := io.ReadAll(f)
-	closeErr := f.Close()
-	if err != nil {
-		return fmt.Errorf("read journaled legacy snapshot %s: %w", entry.path, err)
-	}
-	if closeErr != nil {
-		return fmt.Errorf("close journaled legacy snapshot %s: %w", entry.path, closeErr)
-	}
-	if merlinSnapshotHash(buf) != entry.hash {
-		// The path changed before ctrld touched it. It is no longer attributable
-		// to the old ctrld snapshot, so leave it untouched forever.
+	if !owned {
+		// The public pathname was replaced or modified after journal creation.
+		// Drop only ctrld's private anchor and leave the public file untouched.
+		if err := removeLegacySnapshotAnchor(entry.path); err != nil {
+			return err
+		}
 		return removeLegacyJournalEntry(journal, index)
 	}
 
 	if err := os.Rename(entry.path, qpath); err != nil {
 		if os.IsNotExist(err) {
-			return removeLegacyJournalEntry(journal, index)
+			return cleanupPendingLegacySnapshot(journal, index)
 		}
 		return fmt.Errorf("quarantine legacy snapshot %s: %w", entry.path, err)
 	}
@@ -615,15 +647,14 @@ func cleanupPendingLegacySnapshot(journal *legacyCleanupJournal, index int) erro
 		return fmt.Errorf("sync legacy snapshot quarantine: %w", err)
 	}
 
-	qInfo, err := os.Stat(qpath)
+	owned, err = snapshotFileStillOwned(qpath, anchor, entry.hash)
 	if err != nil {
-		return fmt.Errorf("stat quarantined legacy snapshot %s: %w", qpath, err)
+		return err
 	}
-	qBuf, err := os.ReadFile(qpath)
-	if err != nil {
-		return fmt.Errorf("read quarantined legacy snapshot %s: %w", qpath, err)
-	}
-	if !os.SameFile(info, qInfo) || merlinSnapshotHash(qBuf) != entry.hash {
+	if !owned {
+		// A pathname replacement won the race between the pre-rename identity
+		// check and rename(2). Restore the captured replacement; the original
+		// ctrld inode remains proven by the private anchor only.
 		journal.entries[index].state = legacyEntryRestore
 		if err := writeLegacyCleanupJournal(*journal); err != nil {
 			return fmt.Errorf("journal replaced legacy snapshot restoration: %w", err)
@@ -641,16 +672,18 @@ func cleanupPendingLegacySnapshot(journal *legacyCleanupJournal, index int) erro
 func finalizeLegacySnapshotDelete(journal *legacyCleanupJournal, index int) error {
 	entry := journal.entries[index]
 	qpath := legacySnapshotQuarantinePath(entry.path)
+	anchor := legacySnapshotAnchorPath(entry.path)
+
 	qExists, err := pathExists(qpath)
 	if err != nil {
 		return err
 	}
 	if qExists {
-		buf, err := os.ReadFile(qpath)
+		owned, err := snapshotFileStillOwned(qpath, anchor, entry.hash)
 		if err != nil {
-			return fmt.Errorf("read quarantined legacy snapshot %s: %w", qpath, err)
+			return err
 		}
-		if merlinSnapshotHash(buf) != entry.hash {
+		if !owned {
 			journal.entries[index].state = legacyEntryRestore
 			if err := writeLegacyCleanupJournal(*journal); err != nil {
 				return fmt.Errorf("journal modified legacy snapshot restoration: %w", err)
@@ -661,20 +694,26 @@ func finalizeLegacySnapshotDelete(journal *legacyCleanupJournal, index int) erro
 			return fmt.Errorf("remove quarantined legacy snapshot %s: %w", qpath, err)
 		}
 	}
+	if err := removeLegacySnapshotAnchor(entry.path); err != nil {
+		return err
+	}
 	return removeLegacyJournalEntry(journal, index)
 }
 
 func restoreLegacySnapshot(journal *legacyCleanupJournal, index int) error {
 	entry := journal.entries[index]
 	qpath := legacySnapshotQuarantinePath(entry.path)
+
 	qExists, err := pathExists(qpath)
 	if err != nil {
 		return err
 	}
 	if !qExists {
-		// Either restoration/removal completed before a journal update failed or
-		// no destructive operation ever occurred. Never infer ownership from the
-		// public path on retry.
+		// Restoration/removal completed before the journal update, or no
+		// destructive operation occurred. Never infer ownership from public state.
+		if err := removeLegacySnapshotAnchor(entry.path); err != nil {
+			return err
+		}
 		return removeLegacyJournalEntry(journal, index)
 	}
 
@@ -703,6 +742,9 @@ func restoreLegacySnapshot(journal *legacyCleanupJournal, index int) error {
 	}
 	if err := removeFileDurable(qpath); err != nil {
 		return fmt.Errorf("remove restored legacy snapshot quarantine: %w", err)
+	}
+	if err := removeLegacySnapshotAnchor(entry.path); err != nil {
+		return err
 	}
 	return removeLegacyJournalEntry(journal, index)
 }
