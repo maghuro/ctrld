@@ -306,10 +306,9 @@ func Test_writeMerlinHookUpdatesPreflightsAllPaths(t *testing.T) {
 }
 
 func Test_writeMerlinHookUpdatesRollsBackPartialWrites(t *testing.T) {
-	firstDir := t.TempDir()
-	secondDir := t.TempDir()
-	first := filepath.Join(firstDir, "dnsmasq.postconf")
-	second := filepath.Join(secondDir, "dnsmasq-sdn.postconf")
+	dir := t.TempDir()
+	first := filepath.Join(dir, "dnsmasq.postconf")
+	second := filepath.Join(dir, "dnsmasq-sdn.postconf")
 	orig := []byte("#!/bin/sh\necho original\n")
 	if err := os.WriteFile(first, orig, 0750); err != nil {
 		t.Fatal(err)
@@ -317,13 +316,18 @@ func Test_writeMerlinHookUpdatesRollsBackPartialWrites(t *testing.T) {
 	if err := os.WriteFile(second, []byte("#!/bin/sh\necho second\n"), 0750); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Chmod(secondDir, 0555); err != nil {
-		t.Fatal(err)
+
+	writes := 0
+	writeFile := func(path string, data []byte, mode os.FileMode) error {
+		writes++
+		if writes == 2 {
+			return os.ErrPermission
+		}
+		return atomicWriteFile(path, data, mode)
 	}
-	defer os.Chmod(secondDir, 0755)
 
 	block := []byte("# BEGIN ctrld\necho managed\n# END ctrld")
-	if err := writeMerlinHookUpdates([]string{first, second}, block); err == nil {
+	if err := writeMerlinHookUpdatesWith([]string{first, second}, block, writeFile); err == nil {
 		t.Fatal("expected second write failure")
 	}
 	got, err := os.ReadFile(first)
