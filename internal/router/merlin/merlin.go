@@ -2,8 +2,9 @@ package merlin
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -20,6 +21,12 @@ import (
 )
 
 const Name = "merlin"
+
+const (
+	merlinManagedStatePath = "/jffs/controld/.merlin-dnsmasq-hooks-v2"
+	merlinSnapshotStatePath = "/jffs/controld/.merlin-dnsmasq-snapshot"
+	merlinCleanupPendingPath = "/jffs/controld/.merlin-dnsmasq-cleanup-pending"
+)
 
 // nvramKvMap is a map of NVRAM key-value pairs used to configure and manage Merlin-specific settings.
 var nvramKvMap = map[string]string{
@@ -59,8 +66,23 @@ func (m *Merlin) Uninstall(_ *service.Config) error {
 
 // PreRun prepares the Merlin instance for operation by waiting for essential services and directories to become available.
 func (m *Merlin) PreRun() error {
+	// Reconcile any previous Merlin integration before starting again. Router
+	// startup is a one-shot launch, so retry transient JFFS/NVRAM/dnsmasq errors
+	// here instead of abandoning DNS in a partially reconciled state.
+	var cleanupErr error
+	for attempt := 1; attempt <= 3; attempt++ {
+		cleanupErr = m.Cleanup()
+		if cleanupErr == nil {
+			break
+		}
+		if attempt < 3 {
+			time.Sleep(time.Second)
+		}
+	}
+	if cleanupErr != nil {
+		return fmt.Errorf("failed to cleanup previous Merlin integration after retries: %w", cleanupErr)
+	}
 	// Wait NTP ready.
-	_ = m.Cleanup()
 	if err := ntp.WaitNvram(); err != nil {
 		return err
 	}
@@ -80,101 +102,577 @@ func (m *Merlin) PreRun() error {
 }
 
 // Setup initializes and configures the Merlin instance for use, including setting up dnsmasq and necessary nvram settings.
-func (m *Merlin) Setup() error {
+func (m *Merlin) Setup() (retErr error) {
 	if m.cfg.FirstListener().IsDirectDnsListener() {
 		return nil
 	}
 	// Already setup.
-	if val, _ := nvram.Run("get", nvram.CtrldSetupKey); val == "1" {
+	setupVal, err := nvram.Run("get", nvram.CtrldSetupKey)
+	if err != nil {
+		return fmt.Errorf("read Merlin setup state: %w", err)
+	}
+	if setupVal == "1" {
 		return nil
+	}
+
+	// Mark this as the hook-based integration before changing NVRAM so any
+	// failure after this point is rollback-visible.
+	if err := atomicWriteFile(merlinManagedStatePath, []byte("hooks-v2\n"), 0600); err != nil {
+		return fmt.Errorf("failed to write Merlin integration state: %w", err)
+	}
+
+	defer func() {
+		if retErr == nil {
+			return
+		}
+		if cleanupErr := m.Cleanup(); cleanupErr != nil {
+			retErr = fmt.Errorf("%v; rollback failed: %w", retErr, cleanupErr)
+		}
+	}()
+
+	// Apply NVRAM changes before regenerating dnsmasq so the firmware-generated
+	// config reflects ctrld's desired DNS Privacy state. nvram.SetKV rolls back
+	// its own partial mutations on failure.
+	if err := nvram.SetKV(nvramKvMap, nvram.CtrldSetupKey); err != nil {
+		return err
 	}
 
 	if err := m.writeDnsmasqPostconf(); err != nil {
 		return err
 	}
 
-	for _, cfg := range getDnsmasqConfigs() {
-		if err := m.setupDnsmasq(cfg); err != nil {
-			return fmt.Errorf("failed to setup dnsmasq: config: %s, error: %w", cfg.confPath, err)
-		}
-	}
-
-	// Restart dnsmasq service.
+	// On Merlin 3006 this restarts the main and all SDN dnsmasq instances,
+	// causing dnsmasq.postconf and dnsmasq-sdn.postconf to run.
 	if err := restartDNSMasq(); err != nil {
 		return err
 	}
 
-	if err := nvram.SetKV(nvramKvMap, nvram.CtrldSetupKey); err != nil {
+	mainOK, err := m.dnsmasqConfigUsesCtrld(dnsmasq.MerlinConfPath)
+	if err != nil {
 		return err
+	}
+	if !mainOK {
+		// Compatibility fallback for older Merlin devices where postconf is
+		// known not to execute. Never overwrite an unowned user config.
+		if err := m.setupMainDnsmasqFallback(); err != nil {
+			return err
+		}
+		if err := restartDNSMasq(); err != nil {
+			return err
+		}
+		mainOK, err = m.dnsmasqConfigUsesCtrld(dnsmasq.MerlinConfPath)
+		if err != nil {
+			return err
+		}
+		if !mainOK {
+			return fmt.Errorf("Merlin dnsmasq integration was not applied to %s", dnsmasq.MerlinConfPath)
+		}
+	}
+
+	// Additional dnsmasq instances are Guest Network Pro / SDN instances on
+	// Merlin 3006. Their supported extension point is dnsmasq-sdn.postconf;
+	// full /jffs/configs/dnsmasq-N.conf files are not consumed by Merlin.
+	for _, path := range dnsmasq.AdditionalConfigFiles() {
+		ok, err := m.dnsmasqConfigUsesCtrld(path)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return fmt.Errorf("Merlin SDN dnsmasq integration was not applied to %s", path)
+		}
 	}
 
 	return nil
+}
+
+type legacySnapshotEntry struct {
+	path string
+	hash string
+}
+
+type legacyCleanupJournal struct {
+	phase   string
+	entries []legacySnapshotEntry
 }
 
 // Cleanup restores the original dnsmasq and nvram configurations and restarts dnsmasq if necessary.
 func (m *Merlin) Cleanup() error {
+	// Preserve the existing direct-listener lifecycle. A direct listener needs
+	// port 53 itself; restarting dnsmasq here would reclaim that port before
+	// ctrld binds. Transitioning between forwarding and direct-listener modes
+	// requires a separate port-ownership design and is outside this change.
 	if m.cfg.FirstListener().IsDirectDnsListener() {
 		return nil
 	}
-	if val, _ := nvram.Run("get", nvram.CtrldSetupKey); val != "1" {
-		return nil // was restored, nothing to do.
+
+	setupVal, err := nvram.Run("get", nvram.CtrldSetupKey)
+	if err != nil {
+		return fmt.Errorf("read Merlin setup state during cleanup: %w", err)
+	}
+	managed, err := pathExists(merlinManagedStatePath)
+	if err != nil {
+		return fmt.Errorf("stat Merlin managed state: %w", err)
 	}
 
-	// Restore old configs.
-	if err := nvram.Restore(nvramKvMap, nvram.CtrldSetupKey); err != nil {
-		return err
+	journal, err := readLegacyCleanupJournal()
+	if err != nil {
+		return fmt.Errorf("read Merlin legacy cleanup state: %w", err)
+	}
+	if setupVal != "1" && !managed && journal.phase == "" {
+		return nil
 	}
 
-	if err := cleanupDnsmasqPostconf(dnsmasq.MerlinPostConfPath); err != nil {
-		return err
-	}
-
-	for _, cfg := range getDnsmasqConfigs() {
-		if err := m.cleanupDnsmasqJffs(cfg); err != nil {
-			return fmt.Errorf("failed to cleanup jffs dnsmasq: config: %s, error: %w", cfg.confPath, err)
+	legacy := journal.phase != "" || (setupVal == "1" && !managed)
+	if legacy && journal.phase == "" {
+		journal, err = buildLegacyCleanupJournal()
+		if err != nil {
+			return err
+		}
+		if err := writeLegacyCleanupJournal(journal); err != nil {
+			return fmt.Errorf("journal legacy dnsmasq snapshots: %w", err)
 		}
 	}
-	// Restart dnsmasq service.
+
+	for _, path := range []string{dnsmasq.MerlinPostConfPath, dnsmasq.MerlinSdnPostConfPath} {
+		if err := cleanupDnsmasqPostconf(path); err != nil {
+			return err
+		}
+	}
+
+	if legacy {
+		switch journal.phase {
+		case "cleanup-v1":
+			// The exact snapshot paths and hashes were durably recorded before
+			// the first destructive operation. Retries consult only this journal,
+			// never a fresh directory enumeration, so a user-created replacement
+			// cannot be mistaken for ctrld's old snapshot.
+			for _, entry := range journal.entries {
+				buf, err := os.ReadFile(entry.path)
+				switch {
+				case err == nil:
+					if merlinSnapshotHash(buf) != entry.hash {
+						continue
+					}
+					if err := os.Remove(entry.path); err != nil && !os.IsNotExist(err) {
+						return fmt.Errorf("remove journaled legacy snapshot %s: %w", entry.path, err)
+					}
+				case os.IsNotExist(err):
+					// Already removed on a previous attempt.
+				default:
+					return fmt.Errorf("read journaled legacy snapshot %s: %w", entry.path, err)
+				}
+			}
+			if err := syncParentDir(dnsmasq.MerlinJffsConfDir); err != nil {
+				return fmt.Errorf("sync legacy snapshot directory: %w", err)
+			}
+			journal.phase = "finalize"
+			journal.entries = nil
+			if err := writeLegacyCleanupJournal(journal); err != nil {
+				return fmt.Errorf("advance Merlin legacy cleanup state: %w", err)
+			}
+		case "finalize":
+			// Destructive legacy cleanup already completed. A retry must never
+			// reinterpret newly created user files as legacy ctrld snapshots.
+		default:
+			return fmt.Errorf("unknown Merlin legacy cleanup phase %q", journal.phase)
+		}
+	} else {
+		if err := cleanupOwnedMainSnapshot(); err != nil {
+			return err
+		}
+	}
+
+	// Restore NVRAM only after ctrld-owned artifacts are cleaned successfully.
+	if setupVal == "1" {
+		if err := nvram.Restore(nvramKvMap, nvram.CtrldSetupKey); err != nil {
+			return err
+		}
+	}
+
 	if err := restartDNSMasq(); err != nil {
 		return err
+	}
+
+	if err := removeFileDurable(merlinManagedStatePath); err != nil {
+		return fmt.Errorf("remove Merlin managed state: %w", err)
+	}
+	if journal.phase != "" {
+		if err := removeFileDurable(merlinCleanupPendingPath); err != nil {
+			return fmt.Errorf("remove Merlin legacy cleanup state: %w", err)
+		}
 	}
 	return nil
 }
 
-// setupDnsmasq sets up dnsmasq configuration by writing postconf, copying configuration, and running a postconf script.
-func (m *Merlin) setupDnsmasq(cfg *dnsmasqConfig) error {
-	src, err := os.Open(cfg.confPath)
+func buildLegacyCleanupJournal() (legacyCleanupJournal, error) {
+	paths := []string{dnsmasq.MerlinJffsConfPath}
+	matches, err := filepath.Glob(filepath.Join(dnsmasq.MerlinJffsConfDir, "dnsmasq-*.conf"))
+	if err != nil {
+		return legacyCleanupJournal{}, err
+	}
+	paths = append(paths, matches...)
+
+	journal := legacyCleanupJournal{phase: "cleanup-v1"}
+	for _, path := range paths {
+		if !isLegacySnapshotPath(path) {
+			continue
+		}
+		buf, err := os.ReadFile(path)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			return legacyCleanupJournal{}, fmt.Errorf("read legacy dnsmasq snapshot %s: %w", path, err)
+		}
+		journal.entries = append(journal.entries, legacySnapshotEntry{
+			path: path,
+			hash: merlinSnapshotHash(buf),
+		})
+	}
+	return journal, nil
+}
+
+func writeLegacyCleanupJournal(journal legacyCleanupJournal) error {
+	buf, err := encodeLegacyCleanupJournal(journal)
+	if err != nil {
+		return err
+	}
+	return atomicWriteFile(merlinCleanupPendingPath, buf, 0600)
+}
+
+func encodeLegacyCleanupJournal(journal legacyCleanupJournal) ([]byte, error) {
+	var b strings.Builder
+	b.WriteString(journal.phase)
+	b.WriteByte('\n')
+	for _, entry := range journal.entries {
+		if !isLegacySnapshotPath(entry.path) {
+			return nil, fmt.Errorf("invalid legacy snapshot path %q", entry.path)
+		}
+		if _, err := hex.DecodeString(entry.hash); err != nil || len(entry.hash) != sha256.Size*2 {
+			return nil, fmt.Errorf("invalid legacy snapshot hash for %s", entry.path)
+		}
+		b.WriteString(entry.path)
+		b.WriteByte('\t')
+		b.WriteString(entry.hash)
+		b.WriteByte('\n')
+	}
+	return []byte(b.String()), nil
+}
+
+func readLegacyCleanupJournal() (legacyCleanupJournal, error) {
+	buf, err := os.ReadFile(merlinCleanupPendingPath)
 	if os.IsNotExist(err) {
-		return nil // nothing to do if conf file does not exist.
+		return legacyCleanupJournal{}, nil
 	}
 	if err != nil {
-		return fmt.Errorf("failed to open dnsmasq config: %w", err)
+		return legacyCleanupJournal{}, err
 	}
-	defer src.Close()
+	return parseLegacyCleanupJournal(buf)
+}
 
-	// Copy current dnsmasq config to cfg.jffsConfPath,
-	// Then we will run postconf script on this file.
-	//
-	// Normally, adding postconf script is enough. However, we see
-	// reports on some Merlin devices that postconf scripts does not
-	// work, but manipulating the config directly via /jffs/configs does.
-	dst, err := os.Create(cfg.jffsConfPath)
+func parseLegacyCleanupJournal(buf []byte) (legacyCleanupJournal, error) {
+	lines := strings.Split(strings.TrimSpace(string(buf)), "\n")
+	if len(lines) == 0 || lines[0] == "" {
+		return legacyCleanupJournal{}, fmt.Errorf("empty legacy cleanup journal")
+	}
+	journal := legacyCleanupJournal{phase: lines[0]}
+	if journal.phase == "finalize" {
+		if len(lines) != 1 {
+			return legacyCleanupJournal{}, fmt.Errorf("finalize journal contains snapshot entries")
+		}
+		return journal, nil
+	}
+	if journal.phase != "cleanup-v1" {
+		return legacyCleanupJournal{}, fmt.Errorf("unknown legacy cleanup phase %q", journal.phase)
+	}
+	for _, line := range lines[1:] {
+		if line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, "\t", 2)
+		if len(parts) != 2 || !isLegacySnapshotPath(parts[0]) {
+			return legacyCleanupJournal{}, fmt.Errorf("invalid legacy cleanup journal entry %q", line)
+		}
+		if len(parts[1]) != sha256.Size*2 {
+			return legacyCleanupJournal{}, fmt.Errorf("invalid legacy snapshot hash for %s", parts[0])
+		}
+		if _, err := hex.DecodeString(parts[1]); err != nil {
+			return legacyCleanupJournal{}, fmt.Errorf("invalid legacy snapshot hash for %s: %w", parts[0], err)
+		}
+		journal.entries = append(journal.entries, legacySnapshotEntry{path: parts[0], hash: parts[1]})
+	}
+	return journal, nil
+}
+
+func isLegacySnapshotPath(path string) bool {
+	if path == dnsmasq.MerlinJffsConfPath {
+		return true
+	}
+	if filepath.Dir(path) != dnsmasq.MerlinJffsConfDir {
+		return false
+	}
+	base := filepath.Base(path)
+	if !strings.HasPrefix(base, "dnsmasq-") || !strings.HasSuffix(base, ".conf") {
+		return false
+	}
+	middle := strings.TrimSuffix(strings.TrimPrefix(base, "dnsmasq-"), ".conf")
+	if middle == "" {
+		return false
+	}
+	for _, r := range middle {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func readMerlinState(path string) (string, error) {
+	buf, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return "", nil
+	}
 	if err != nil {
-		return fmt.Errorf("failed to create %s: %w", cfg.jffsConfPath, err)
+		return "", err
 	}
-	defer dst.Close()
+	return strings.TrimSpace(string(buf)), nil
+}
 
-	if _, err := io.Copy(dst, src); err != nil {
-		return fmt.Errorf("failed to copy current dnsmasq config: %w", err)
+// dnsmasqConfigUsesCtrld reports whether a generated dnsmasq config has the
+// complete ctrld forwarding shape, not merely one matching server line.
+func (m *Merlin) dnsmasqConfigUsesCtrld(path string) (bool, error) {
+	buf, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return false, nil
 	}
-	if err := dst.Close(); err != nil {
-		return fmt.Errorf("failed to save %s: %w", cfg.jffsConfPath, err)
+	if err != nil {
+		return false, err
 	}
 
-	// Run postconf script on cfg.jffsConfPath directly.
-	cmd := exec.Command("/bin/sh", dnsmasq.MerlinPostConfPath, cfg.jffsConfPath)
+	listener := m.cfg.FirstListener()
+	if listener == nil {
+		return false, fmt.Errorf("missing ctrld listener")
+	}
+	ip := listener.IP
+	if ip == "" || ip == "0.0.0.0" || ip == "::" {
+		ip = "127.0.0.1"
+	}
+	expectedServer := fmt.Sprintf("server=%s#%d", ip, listener.Port)
+
+	var (
+		serverCount int
+		expectedSeen bool
+		noResolv     bool
+		addMAC       bool
+		addSubnet    bool
+		cacheOff     bool
+	)
+	for _, raw := range strings.Split(string(buf), "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		switch {
+		case strings.HasPrefix(line, "server="):
+			serverCount++
+			if line == expectedServer {
+				expectedSeen = true
+			}
+		case strings.HasPrefix(line, "servers-file="),
+			strings.HasPrefix(line, "resolv-file="),
+			line == "dnssec",
+			strings.HasPrefix(line, "trust-anchor="):
+			return false, nil
+		case line == "no-resolv":
+			noResolv = true
+		case line == "add-mac":
+			addMAC = true
+		case line == "add-subnet=32,128":
+			addSubnet = true
+		case line == "cache-size=0":
+			cacheOff = true
+		}
+	}
+
+	return serverCount == 1 && expectedSeen && noResolv && addMAC && addSubnet && cacheOff, nil
+}
+
+// setupMainDnsmasqFallback retains the old full-config mechanism only for the
+// main dnsmasq when the supported postconf hook demonstrably did not apply.
+// Ownership is published before the final snapshot, and content hashes prevent
+// ctrld from later deleting or overwriting a user-modified file.
+func (m *Merlin) setupMainDnsmasqFallback() error {
+	owned, err := mainSnapshotOwnership()
+	if err != nil {
+		return err
+	}
+	snapshotExists, err := pathExists(dnsmasq.MerlinJffsConfPath)
+	if err != nil {
+		return fmt.Errorf("stat Merlin fallback config: %w", err)
+	}
+	if snapshotExists {
+		if !owned {
+			return fmt.Errorf("refusing to overwrite unowned or modified Merlin custom config: %s", dnsmasq.MerlinJffsConfPath)
+		}
+		if err := cleanupOwnedMainSnapshot(); err != nil {
+			return err
+		}
+	} else {
+		stateExists, err := pathExists(merlinSnapshotStatePath)
+		if err != nil {
+			return fmt.Errorf("stat Merlin fallback ownership: %w", err)
+		}
+		if stateExists {
+			// A previous crash may have published ownership before the snapshot.
+			if err := removeFileDurable(merlinSnapshotStatePath); err != nil {
+				return fmt.Errorf("remove orphaned Merlin snapshot state: %w", err)
+			}
+		}
+	}
+
+	buf, err := os.ReadFile(dnsmasq.MerlinConfPath)
+	if err != nil {
+		return fmt.Errorf("failed to read dnsmasq config for fallback: %w", err)
+	}
+	built, err := m.buildMainDnsmasqFallback(buf)
+	if err != nil {
+		return err
+	}
+	hash := merlinSnapshotHash(built)
+
+	// Publish durable ownership first. If the router stops before the snapshot
+	// rename, cleanup sees a harmless orphaned marker and removes it.
+	if err := atomicWriteFile(merlinSnapshotStatePath, []byte("sha256="+hash+"\n"), 0600); err != nil {
+		return fmt.Errorf("mark ctrld dnsmasq fallback ownership: %w", err)
+	}
+	if err := atomicWriteFile(dnsmasq.MerlinJffsConfPath, built, 0644); err != nil {
+		current, readErr := os.ReadFile(dnsmasq.MerlinJffsConfPath)
+		switch {
+		case readErr == nil && merlinSnapshotHash(current) == hash:
+			// Rename reached the target. Keep the already-durable ownership marker
+			// so deferred/retry cleanup can safely remove the visible fallback.
+			return fmt.Errorf("publish ctrld dnsmasq fallback after rename: %w", err)
+		case os.IsNotExist(readErr):
+			if removeErr := removeFileDurable(merlinSnapshotStatePath); removeErr != nil {
+				return fmt.Errorf("publish ctrld dnsmasq fallback: %w; remove ownership state: %v", err, removeErr)
+			}
+			return fmt.Errorf("publish ctrld dnsmasq fallback: %w", err)
+		case readErr == nil:
+			// A different readable file is present, so ctrld cannot claim it.
+			if removeErr := removeFileDurable(merlinSnapshotStatePath); removeErr != nil {
+				return fmt.Errorf("publish ctrld dnsmasq fallback: %w; unexpected target and ownership cleanup failed: %v", err, removeErr)
+			}
+			return fmt.Errorf("publish ctrld dnsmasq fallback: %w; target content does not match ctrld snapshot", err)
+		default:
+			// Publication state is uncertain. Retain the marker rather than turn
+			// a possibly successful rename into a permanently unowned snapshot.
+			return fmt.Errorf("publish ctrld dnsmasq fallback: %w; verify target: %v", err, readErr)
+		}
+	}
+	return nil
+}
+
+func (m *Merlin) buildMainDnsmasqFallback(buf []byte) ([]byte, error) {
+	tmp, err := os.CreateTemp(dnsmasq.MerlinJffsConfDir, ".dnsmasq.conf.ctrld-build-*")
+	if err != nil {
+		return nil, fmt.Errorf("create ctrld dnsmasq fallback build file: %w", err)
+	}
+	path := tmp.Name()
+	defer os.Remove(path)
+
+	if err := tmp.Chmod(0644); err != nil {
+		_ = tmp.Close()
+		return nil, err
+	}
+	if _, err := tmp.Write(buf); err != nil {
+		_ = tmp.Close()
+		return nil, err
+	}
+	if err := tmp.Close(); err != nil {
+		return nil, err
+	}
+
+	script, err := dnsmasq.ConfTmpl(dnsmasq.MerlinPostConfTmpl, m.cfg)
+	if err != nil {
+		return nil, fmt.Errorf("render ctrld fallback postconf: %w", err)
+	}
+	// Apply only ctrld's managed logic. Executing the shared Merlin hook here
+	// would also execute unrelated addon/user blocks a second time against a
+	// temporary file.
+	cmd := exec.Command("/bin/sh", "-c", script, "ctrld-fallback", path)
 	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("failed to run post conf: %s: %w", string(out), err)
+		return nil, fmt.Errorf("failed to apply ctrld fallback postconf: %s: %w", string(out), err)
+	}
+	built, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read ctrld dnsmasq fallback build: %w", err)
+	}
+	return built, nil
+}
+
+func merlinSnapshotHash(buf []byte) string {
+	sum := sha256.Sum256(buf)
+	return hex.EncodeToString(sum[:])
+}
+
+func readMainSnapshotHash() (string, bool, error) {
+	state, err := readMerlinState(merlinSnapshotStatePath)
+	if err != nil {
+		return "", false, err
+	}
+	if state == "" {
+		return "", false, nil
+	}
+	const prefix = "sha256="
+	if !strings.HasPrefix(state, prefix) || len(state) != len(prefix)+sha256.Size*2 {
+		return "", false, fmt.Errorf("invalid Merlin dnsmasq snapshot ownership state")
+	}
+	hash := strings.TrimPrefix(state, prefix)
+	if _, err := hex.DecodeString(hash); err != nil {
+		return "", false, fmt.Errorf("invalid Merlin dnsmasq snapshot hash: %w", err)
+	}
+	return hash, true, nil
+}
+
+func mainSnapshotOwnership() (bool, error) {
+	expected, marked, err := readMainSnapshotHash()
+	if err != nil || !marked {
+		return false, err
+	}
+	buf, err := os.ReadFile(dnsmasq.MerlinJffsConfPath)
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return merlinSnapshotHash(buf) == expected, nil
+}
+
+func cleanupOwnedMainSnapshot() error {
+	expected, marked, err := readMainSnapshotHash()
+	if err != nil {
+		return err
+	}
+	if !marked {
+		return nil
+	}
+
+	buf, err := os.ReadFile(dnsmasq.MerlinJffsConfPath)
+	if os.IsNotExist(err) {
+		return removeFileDurable(merlinSnapshotStatePath)
+	}
+	if err != nil {
+		return err
+	}
+	if merlinSnapshotHash(buf) != expected {
+		return fmt.Errorf("refusing to remove modified Merlin dnsmasq fallback: %s", dnsmasq.MerlinJffsConfPath)
+	}
+	if err := removeFileDurable(dnsmasq.MerlinJffsConfPath); err != nil {
+		return err
+	}
+	if err := removeFileDurable(merlinSnapshotStatePath); err != nil {
+		return err
 	}
 	return nil
 }
@@ -188,6 +686,8 @@ func (m *Merlin) cleanupDnsmasqJffs(cfg *dnsmasqConfig) error {
 	return nil
 }
 
+// merlinHookUpdate is prepared entirely before any shared hook is modified.
+// This lets us validate/read both Merlin hook paths before the first write.
 type merlinHookUpdate struct {
 	path          string
 	data          []byte
@@ -197,9 +697,10 @@ type merlinHookUpdate struct {
 	symlinkTarget string
 }
 
-// writeDnsmasqPostconf manages only ctrld's marked block in the shared main
-// dnsmasq.postconf hook. Merlin 3006 SDN support is intentionally handled in a
-// separate change so this patch does not alter router lifecycle semantics.
+// writeDnsmasqPostconf installs ctrld-owned blocks in Merlin's main and SDN
+// hooks while preserving unrelated content. Both paths are preflighted before
+// either is modified, avoiding a half-installed integration when the second
+// shared hook is unreadable or otherwise invalid.
 func (m *Merlin) writeDnsmasqPostconf() error {
 	data, err := dnsmasq.ConfTmpl(dnsmasq.MerlinPostConfTmpl, m.cfg)
 	if err != nil {
@@ -211,43 +712,73 @@ func (m *Merlin) writeDnsmasqPostconf() error {
 		dnsmasq.MerlinPostConfEndMarker,
 	}, "\n"))
 
-	update, err := prepareMerlinHookUpdate(dnsmasq.MerlinPostConfPath, block)
-	if err != nil {
-		return err
+	return writeMerlinHookUpdates(
+		[]string{dnsmasq.MerlinPostConfPath, dnsmasq.MerlinSdnPostConfPath},
+		block,
+	)
+}
+
+func writeMerlinHookUpdates(paths []string, block []byte) error {
+	return writeMerlinHookUpdatesWith(paths, block, atomicWriteFile)
+}
+
+func writeMerlinHookUpdatesWith(
+	paths []string,
+	block []byte,
+	writeFile func(string, []byte, os.FileMode) error,
+) error {
+	updates := make([]merlinHookUpdate, 0, len(paths))
+	for _, path := range paths {
+		update, err := prepareMerlinHookUpdate(path, block)
+		if err != nil {
+			return err
+		}
+		updates = append(updates, update)
 	}
-	if err := revalidateMerlinHookUpdate(update); err != nil {
-		return fmt.Errorf("revalidate Merlin hook %s: %w", update.path, err)
+
+	written := make([]merlinHookUpdate, 0, len(updates))
+	for _, update := range updates {
+		if err := revalidateMerlinHookUpdate(update); err != nil {
+			if rollbackErr := rollbackMerlinHookUpdates(written); rollbackErr != nil {
+				return fmt.Errorf("revalidate Merlin hook %s: %w; rollback failed: %v", update.path, err, rollbackErr)
+			}
+			return fmt.Errorf("revalidate Merlin hook %s: %w", update.path, err)
+		}
+		if err := writeFile(update.path, update.data, 0750); err != nil {
+			if rollbackErr := rollbackMerlinHookUpdates(written); rollbackErr != nil {
+				return fmt.Errorf("write Merlin hook %s: %w; rollback failed: %v", update.path, err, rollbackErr)
+			}
+			return fmt.Errorf("write Merlin hook %s: %w", update.path, err)
+		}
+		written = append(written, update)
 	}
-	if err := atomicWriteFile(update.path, update.data, 0750); err != nil {
-		return fmt.Errorf("write Merlin hook %s: %w", update.path, err)
+	return nil
+}
+
+func rollbackMerlinHookUpdates(updates []merlinHookUpdate) error {
+	for i := len(updates) - 1; i >= 0; i-- {
+		update := updates[i]
+		current, err := os.ReadFile(update.path)
+		if err != nil {
+			return fmt.Errorf("read %s during rollback: %w", update.path, err)
+		}
+		if !bytes.Equal(current, update.data) {
+			return fmt.Errorf("refusing to roll back %s after external modification", update.path)
+		}
+		if update.existed {
+			if err := atomicWriteFile(update.path, update.original, 0750); err != nil {
+				return fmt.Errorf("restore %s: %w", update.path, err)
+			}
+			continue
+		}
+		if err := os.Remove(update.path); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("remove newly created %s: %w", update.path, err)
+		}
 	}
 	return nil
 }
 
 func prepareMerlinHookUpdate(path string, block []byte) (merlinHookUpdate, error) {
-	return prepareMerlinHookReplacement(path, func(buf []byte) []byte {
-		return merlinUpsertPostConf(buf, block)
-	})
-}
-
-func prepareMerlinHookCleanup(path string) (*merlinHookUpdate, error) {
-	info, err := os.Lstat(path)
-	if os.IsNotExist(err) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	_ = info
-
-	update, err := prepareMerlinHookReplacement(path, merlinParsePostConf)
-	if err != nil {
-		return nil, err
-	}
-	return &update, nil
-}
-
-func prepareMerlinHookReplacement(path string, transform func([]byte) []byte) (merlinHookUpdate, error) {
 	info, statErr := os.Lstat(path)
 	pathMissing := os.IsNotExist(statErr)
 	if statErr != nil && !pathMissing {
@@ -264,7 +795,7 @@ func prepareMerlinHookReplacement(path string, transform func([]byte) []byte) (m
 
 	update := merlinHookUpdate{
 		path:     path,
-		data:     transform(buf),
+		data:     merlinUpsertPostConf(buf, block),
 		original: append([]byte(nil), buf...),
 		existed:  !pathMissing,
 	}
@@ -321,19 +852,19 @@ func revalidateMerlinHookUpdate(update merlinHookUpdate) error {
 }
 
 func cleanupDnsmasqPostconf(path string) error {
-	update, err := prepareMerlinHookCleanup(path)
-	if err != nil || update == nil {
-		return err
-	}
-	if bytes.Equal(update.original, update.data) {
+	buf, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
 		return nil
 	}
-	if err := revalidateMerlinHookUpdate(*update); err != nil {
-		return fmt.Errorf("revalidate Merlin hook cleanup %s: %w", path, err)
+	if err != nil {
+		return err
 	}
-	// Never delete a shared Merlin hook outright. Cleanup removes only ctrld's
-	// owned bytes and preserves the path, content and mode belonging to others.
-	return atomicWriteFile(path, update.data, 0750)
+
+	clean := merlinParsePostConf(buf)
+	// Never delete a shared Merlin hook outright. We cannot safely prove
+	// persistent ownership across addon rewrites/reboots, so cleanup removes
+	// only ctrld-owned bytes and leaves any resulting stub in place.
+	return atomicWriteFile(path, clean, 0750)
 }
 
 // restartDNSMasq restarts the dnsmasq service by executing the appropriate system command using "service".
@@ -665,14 +1196,34 @@ func syncParentDir(dir string) error {
 	}
 	defer f.Close()
 	if err := f.Sync(); err != nil {
-		// Directory fsync is not supported by the Windows CI filesystem. Merlin
-		// itself is Unix-only, where this is required for rename durability.
 		if runtime.GOOS == "windows" {
 			return nil
 		}
 		return err
 	}
 	return nil
+}
+
+func pathExists(path string) (bool, error) {
+	_, err := os.Stat(path)
+	if err == nil {
+		return true, nil
+	}
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	return false, err
+}
+
+func removeFileDurable(path string) error {
+	err := os.Remove(path)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return syncParentDir(filepath.Dir(path))
 }
 
 // waitDirExists waits until the specified directory exists, polling its existence every second.

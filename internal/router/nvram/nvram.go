@@ -2,6 +2,7 @@ package nvram
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"os/exec"
 	"strings"
@@ -36,43 +37,111 @@ NOTE:
 */
 
 // SetKV writes the given key/value from map to nvram.
-// The given setupKey is set to 1 to indicates key/value set.
+// The given setupKey is set to 1 to indicate key/value set.
+//
+// NVRAM mutations are not transactional. Keep enough rollback information in
+// volatile NVRAM and restore it on any failure so callers never have to infer
+// whether a partially failed sequence changed router state.
 func SetKV(m map[string]string, setupKey string) error {
-	// Backup current value, store ctrld's configs.
+	modified := make([]string, 0, len(m))
+
+	rollback := func(cause error) error {
+		var restoreErr error
+		for i := len(modified) - 1; i >= 0; i-- {
+			key := modified[i]
+			ctrldKey := CtrldKeyPrefix + key
+			old, err := Run("get", ctrldKey)
+			if err != nil {
+				restoreErr = errors.Join(restoreErr, fmt.Errorf("read rollback %s: %w", ctrldKey, err))
+				continue
+			}
+			if out, err := Run("set", key+"="+old); err != nil {
+				restoreErr = errors.Join(restoreErr, fmt.Errorf("%s: %w", out, err))
+			}
+		}
+
+		if restoreErr != nil {
+			// At least one ctrld-modified value may still be active. Keep an
+			// explicit setup marker so Merlin Cleanup/Restore will retry from the
+			// retained ctrld_* backup values instead of treating the state as clean.
+			var markerErr error
+			if out, err := Run("set", setupKey+"=1"); err != nil {
+				markerErr = errors.Join(markerErr, fmt.Errorf("%s: %w", out, err))
+			}
+			if out, err := Run("commit"); err != nil {
+				markerErr = errors.Join(markerErr, fmt.Errorf("%s: %w", out, err))
+			}
+			return errors.Join(
+				cause,
+				fmt.Errorf("nvram rollback incomplete: %w", restoreErr),
+				markerErr,
+			)
+		}
+
+		if out, err := Run("unset", setupKey); err != nil {
+			return errors.Join(cause, fmt.Errorf("%s: %w", out, err))
+		}
+		if _, err := Run("commit"); err != nil {
+			// The restored values may only be volatile. Re-arm the marker before
+			// returning so the caller's deferred Cleanup has a retryable state.
+			var markerErr error
+			if out, setErr := Run("set", setupKey+"=1"); setErr != nil {
+				markerErr = errors.Join(markerErr, fmt.Errorf("%s: %w", out, setErr))
+			}
+			if out, commitErr := Run("commit"); commitErr != nil {
+				markerErr = errors.Join(markerErr, fmt.Errorf("%s: %w", out, commitErr))
+			}
+			return errors.Join(
+				cause,
+				fmt.Errorf("nvram rollback commit failed: %w", err),
+				markerErr,
+			)
+		}
+		return cause
+	}
+
+	fail := func(err error) error {
+		if len(modified) == 0 {
+			return err
+		}
+		return rollback(err)
+	}
+
 	for key, value := range m {
 		old, err := Run("get", key)
 		if err != nil {
-			return fmt.Errorf("%s: %w", old, err)
+			return fail(fmt.Errorf("%s: %w", old, err))
 		}
 		if out, err := Run("set", CtrldKeyPrefix+key+"="+old); err != nil {
-			return fmt.Errorf("%s: %w", out, err)
+			return fail(fmt.Errorf("%s: %w", out, err))
 		}
+		modified = append(modified, key)
 		if out, err := Run("set", key+"="+value); err != nil {
-			return fmt.Errorf("%s: %w", out, err)
+			return rollback(fmt.Errorf("%s: %w", out, err))
 		}
 	}
 
 	if out, err := Run("set", setupKey+"=1"); err != nil {
-		return fmt.Errorf("%s: %w", out, err)
+		return rollback(fmt.Errorf("%s: %w", out, err))
 	}
-	// Commit.
 	if out, err := Run("commit"); err != nil {
-		return fmt.Errorf("%s: %w", out, err)
+		return rollback(fmt.Errorf("%s: %w", out, err))
 	}
 	return nil
 }
 
-// Restore restores the old value of given key from map m.
-// The given setupKey is set to 0 to indicates key/value restored.
+// Restore restores the old value of each key from ctrld's backup NVRAM.
+// Backup keys are deliberately retained after the restore commit. They are tiny,
+// harmless, and keeping them avoids a second non-transactional "cleanup commit"
+// that could destroy the only rollback copy after a transient nvram failure.
+// A future SetKV overwrites each backup with the then-current value.
 func Restore(m map[string]string, setupKey string) error {
-	// Restore old configs.
 	for key := range m {
 		ctrldKey := CtrldKeyPrefix + key
 		old, err := Run("get", ctrldKey)
 		if err != nil {
 			return fmt.Errorf("%s: %w", old, err)
 		}
-		_, _ = Run("unset", ctrldKey)
 		if out, err := Run("set", key+"="+old); err != nil {
 			return fmt.Errorf("%s: %w", out, err)
 		}
@@ -81,9 +150,12 @@ func Restore(m map[string]string, setupKey string) error {
 	if out, err := Run("unset", setupKey); err != nil {
 		return fmt.Errorf("%s: %w", out, err)
 	}
-	// Commit.
 	if out, err := Run("commit"); err != nil {
+		// Do not persist setupKey=1 after the original values have been restored:
+		// that marker means "ctrld is configured" to other router backends. If
+		// this commit fails, return the error and let the caller retry/reconcile.
 		return fmt.Errorf("%s: %w", out, err)
+
 	}
 	return nil
 }
