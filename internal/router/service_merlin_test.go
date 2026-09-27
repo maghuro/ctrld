@@ -529,3 +529,51 @@ func TestRecoverLegacyMerlinServiceConfigRejectsWrongExecutable(t *testing.T) {
 		t.Fatal("legacy config recovery accepted a different executable")
 	}
 }
+
+
+func TestCanStartMerlinStartupAfterMigrationError(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Merlin startup scripts are Linux-specific")
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ctrld.startup")
+	legacy := []byte("#!/bin/sh\necho legacy\n")
+
+	tests := []struct {
+		name string
+		body []byte
+		want bool
+	}{
+		{"exact legacy", legacy, true},
+		{"current marked", []byte("#!/bin/sh\n" + merlinSvcScriptMarker + "\necho current\n"), true},
+		{"custom", []byte("#!/bin/sh\necho custom\n"), false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := os.WriteFile(path, tc.body, 0755); err != nil {
+				t.Fatal(err)
+			}
+			got, err := canStartMerlinStartupAfterMigrationError(path, legacy)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tc.want {
+				t.Fatalf("canStart = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestCanStartMerlinStartupAfterMigrationErrorMissingPath(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Merlin startup scripts are Linux-specific")
+	}
+	got, err := canStartMerlinStartupAfterMigrationError(filepath.Join(t.TempDir(), "missing.startup"), []byte("legacy"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got {
+		t.Fatal("missing startup path must not be considered safe to start")
+	}
+}
