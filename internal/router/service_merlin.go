@@ -61,7 +61,13 @@ func (s *merlinSvc) configPath() string {
 }
 
 func (s *merlinSvc) template() *template.Template {
-	return template.Must(template.New("").Parse(merlinSvcScript))
+	return template.Must(template.New("").Funcs(template.FuncMap{
+		"shellQuote": merlinShellQuote,
+	}).Parse(merlinSvcScript))
+}
+
+func merlinShellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'"
 }
 
 func (s *merlinSvc) Install() error {
@@ -317,9 +323,8 @@ func (s *merlinSvc) Restart() error {
 
 const merlinSvcScript = `#!/bin/sh
 
-name="{{.Name}}"
-exe="{{.Path}}"
-cmd="{{.Path}}{{range .Arguments}} {{.}}{{end}}"
+name={{shellQuote .Name}}
+exe={{shellQuote .Path}}
 pid_file="/tmp/$name.pid"
 
 get_pid() {
@@ -352,7 +357,7 @@ case "$1" in
         # For John’s fork
         export SSL_CERT_FILE=/rom/ca-bundle.crt
       fi
-      $cmd &
+      {{shellQuote .Path}}{{range .Arguments}} {{shellQuote .}}{{end}} &
       echo $! > "$pid_file"
       chmod 600 "$pid_file"
       started=0
