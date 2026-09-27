@@ -87,7 +87,7 @@ func prepareExistingMerlinStartupScript(path string, expected, legacy []byte) (e
 		// Build the replacement completely in the same directory and publish it
 		// with rename(2). The legacy inode is never truncated, so ENOSPC/EIO while
 		// writing the new script leaves the previously working service intact.
-		if err := replaceMerlinStartupScriptAtomically(path, expected, info); err != nil {
+		if err := replaceMerlinStartupScriptAtomically(path, expected, got, info); err != nil {
 			return true, err
 		}
 		return true, nil
@@ -110,7 +110,7 @@ func prepareExistingMerlinStartupScript(path string, expected, legacy []byte) (e
 	return true, nil
 }
 
-func replaceMerlinStartupScriptAtomically(path string, expected []byte, originalInfo os.FileInfo) (retErr error) {
+func replaceMerlinStartupScriptAtomically(path string, expected, legacy []byte, originalInfo os.FileInfo) (retErr error) {
 	dir := filepath.Dir(path)
 	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".ctrld-migrate-*")
 	if err != nil {
@@ -135,18 +135,50 @@ func replaceMerlinStartupScriptAtomically(path string, expected []byte, original
 		return err
 	}
 
-	// Revalidate ownership immediately before publication. The service-level
-	// flock serializes ctrld lifecycle operations; this check additionally
-	// refuses to overwrite a pathname another actor replaced during migration.
-	pathInfo, err := os.Lstat(path)
-	if err != nil {
-		return err
-	}
-	if !os.SameFile(originalInfo, pathInfo) {
-		return fmt.Errorf("startup script changed before migration publish: %s", path)
+	// Atomically exchange the prepared replacement with whatever currently
+	// occupies path. This avoids the TOCTOU window of "Lstat then Rename": after
+	// the exchange, tmpPath names the exact previous target and can be validated
+	// by inode and bytes. If another actor changed/replaced the legacy script,
+	// swap the files back and leave their content untouched.
+	if err := unix.Renameat2(
+		unix.AT_FDCWD, tmpPath,
+		unix.AT_FDCWD, path,
+		unix.RENAME_EXCHANGE,
+	); err != nil {
+		return fmt.Errorf("atomic startup-script exchange: %w", err)
 	}
 
-	if err := os.Rename(tmpPath, path); err != nil {
+	rollbackExchange := func(cause error) error {
+		if err := unix.Renameat2(
+			unix.AT_FDCWD, tmpPath,
+			unix.AT_FDCWD, path,
+			unix.RENAME_EXCHANGE,
+		); err != nil {
+			return fmt.Errorf("%v; failed to restore startup script after exchange: %w", cause, err)
+		}
+		return cause
+	}
+
+	oldInfo, err := os.Lstat(tmpPath)
+	if err != nil {
+		return rollbackExchange(err)
+	}
+	if !oldInfo.Mode().IsRegular() || !os.SameFile(originalInfo, oldInfo) {
+		return rollbackExchange(fmt.Errorf("startup script changed before migration publish: %s", path))
+	}
+
+	oldBytes, exists, err := readExistingMerlinStartupScript(tmpPath)
+	if err != nil {
+		return rollbackExchange(err)
+	}
+	if !exists || !bytes.Equal(oldBytes, legacy) {
+		return rollbackExchange(fmt.Errorf("startup script contents changed before migration publish: %s", path))
+	}
+
+	// The exchange is now proven to have replaced exactly the ctrld-owned
+	// legacy inode/bytes. Remove the old hard target and make the directory
+	// updates durable.
+	if err := os.Remove(tmpPath); err != nil {
 		return err
 	}
 	if err := syncMerlinServiceDir(dir); err != nil {
@@ -154,3 +186,4 @@ func replaceMerlinStartupScriptAtomically(path string, expected []byte, original
 	}
 	return nil
 }
+
