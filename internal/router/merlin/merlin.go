@@ -653,17 +653,50 @@ func merlinSnapshotHash(buf []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func writeMainSnapshotState(state mainSnapshotState) error {
+func encodeMainSnapshotState(state mainSnapshotState) ([]byte, error) {
 	if state.phase == "" {
-		return fmt.Errorf("empty Merlin snapshot phase")
+		return nil, fmt.Errorf("empty Merlin snapshot phase")
+	}
+	switch state.phase {
+	case snapshotPhasePending, snapshotPhasePublished, snapshotPhaseQuarantine,
+		snapshotPhaseDelete, snapshotPhaseRestore, snapshotPhaseRestored:
+	default:
+		return nil, fmt.Errorf("unknown Merlin snapshot phase %q", state.phase)
 	}
 	if len(state.hash) != sha256.Size*2 {
-		return fmt.Errorf("invalid Merlin snapshot hash length")
+		return nil, fmt.Errorf("invalid Merlin snapshot hash length")
 	}
 	if _, err := hex.DecodeString(state.hash); err != nil {
-		return fmt.Errorf("invalid Merlin snapshot hash: %w", err)
+		return nil, fmt.Errorf("invalid Merlin snapshot hash: %w", err)
 	}
-	buf := []byte("snapshot-v2\nphase=" + state.phase + "\nsha256=" + state.hash + "\n")
+	return []byte("snapshot-v2\nphase=" + state.phase + "\nsha256=" + state.hash + "\n"), nil
+}
+
+func parseMainSnapshotState(buf []byte) (mainSnapshotState, error) {
+	lines := strings.Split(strings.TrimSpace(string(buf)), "\n")
+	if len(lines) == 1 && strings.HasPrefix(lines[0], "sha256=") {
+		return mainSnapshotState{}, fmt.Errorf("unsafe hash-only Merlin snapshot state")
+	}
+	if len(lines) != 3 || lines[0] != "snapshot-v2" ||
+		!strings.HasPrefix(lines[1], "phase=") ||
+		!strings.HasPrefix(lines[2], "sha256=") {
+		return mainSnapshotState{}, fmt.Errorf("invalid Merlin snapshot state")
+	}
+	state := mainSnapshotState{
+		phase: strings.TrimPrefix(lines[1], "phase="),
+		hash:  strings.TrimPrefix(lines[2], "sha256="),
+	}
+	if _, err := encodeMainSnapshotState(state); err != nil {
+		return mainSnapshotState{}, err
+	}
+	return state, nil
+}
+
+func writeMainSnapshotState(state mainSnapshotState) error {
+	buf, err := encodeMainSnapshotState(state)
+	if err != nil {
+		return err
+	}
 	return atomicWriteFile(merlinSnapshotStatePath, buf, 0600)
 }
 
@@ -675,37 +708,9 @@ func readMainSnapshotState() (mainSnapshotState, bool, error) {
 	if err != nil {
 		return mainSnapshotState{}, false, err
 	}
-	lines := strings.Split(strings.TrimSpace(string(buf)), "\n")
-
-	// No released ctrld version wrote this hash-only format. Reject it rather
-	// than guessing inode ownership if an intermediate development build left it.
-	if len(lines) == 1 && strings.HasPrefix(lines[0], "sha256=") {
-		return mainSnapshotState{}, true, fmt.Errorf(
-			"unsafe hash-only Merlin snapshot state requires manual reconciliation: %s",
-			merlinSnapshotStatePath,
-		)
-	}
-	if len(lines) != 3 || lines[0] != "snapshot-v2" ||
-		!strings.HasPrefix(lines[1], "phase=") ||
-		!strings.HasPrefix(lines[2], "sha256=") {
-		return mainSnapshotState{}, true, fmt.Errorf("invalid Merlin snapshot state")
-	}
-
-	state := mainSnapshotState{
-		phase: strings.TrimPrefix(lines[1], "phase="),
-		hash:  strings.TrimPrefix(lines[2], "sha256="),
-	}
-	switch state.phase {
-	case snapshotPhasePending, snapshotPhasePublished, snapshotPhaseQuarantine,
-		snapshotPhaseDelete, snapshotPhaseRestore, snapshotPhaseRestored:
-	default:
-		return mainSnapshotState{}, true, fmt.Errorf("unknown Merlin snapshot phase %q", state.phase)
-	}
-	if len(state.hash) != sha256.Size*2 {
-		return mainSnapshotState{}, true, fmt.Errorf("invalid Merlin snapshot hash length")
-	}
-	if _, err := hex.DecodeString(state.hash); err != nil {
-		return mainSnapshotState{}, true, fmt.Errorf("invalid Merlin snapshot hash: %w", err)
+	state, err := parseMainSnapshotState(buf)
+	if err != nil {
+		return mainSnapshotState{}, true, fmt.Errorf("%w: %s", err, merlinSnapshotStatePath)
 	}
 	return state, true, nil
 }
