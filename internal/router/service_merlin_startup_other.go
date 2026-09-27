@@ -21,7 +21,7 @@ func prepareExistingMerlinStartupScript(path string, expected, legacy []byte) (e
 		return true, fmt.Errorf("startup script is not a regular file: %s", path)
 	}
 
-	f, err := os.Open(path)
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
 	if err != nil {
 		return true, err
 	}
