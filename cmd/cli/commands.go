@@ -681,6 +681,25 @@ func initStopCmd() *cobra.Command {
 	return stopCmd
 }
 
+type restartWithBetweenService interface {
+	RestartWith(func() error) error
+}
+
+func restartServiceTransaction(s service.Service, between func() error) error {
+	if tx, ok := s.(restartWithBetweenService); ok {
+		return tx.RestartWith(between)
+	}
+	if err := s.Stop(); err != nil {
+		return err
+	}
+	if between != nil {
+		if err := between(); err != nil {
+			return err
+		}
+	}
+	return s.Start()
+}
+
 func initRestartCmd() *cobra.Command {
 	restartCmd := &cobra.Command{
 		PreRun: func(cmd *cobra.Command, args []string) {
@@ -726,49 +745,34 @@ func initRestartCmd() *cobra.Command {
 			}
 
 			doRestart := func() bool {
-				tasks := []task{
-					{s.Stop, true, "Stop"},
-					{func() error {
-						p.router.Cleanup()
-						// restore static DNS settings or DHCP
-						p.resetDNS(false, true)
-						return nil
-					}, false, "Cleanup"},
-					{func() error {
-						time.Sleep(time.Second * 1)
-						return nil
-					}, false, "Waiting for service to stop"},
-				}
-				if doTasks(tasks) {
+				between := func() error {
+					p.router.Cleanup()
+					// restore static DNS settings or DHCP
+					p.resetDNS(false, true)
+					time.Sleep(time.Second)
 
 					if router.WaitProcessExited() {
 						ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
 						defer cancel()
 
-					loop:
 						for {
 							select {
 							case <-ctx.Done():
-								mainLog.Load().Error().Msg("timeout while waiting for service to stop")
-								break loop
+								return fmt.Errorf("timeout while waiting for service to stop")
 							default:
 							}
-							time.Sleep(time.Second)
 							if status, _ := s.Status(); status == service.StatusStopped {
 								break
 							}
+							time.Sleep(time.Second)
 						}
 					}
-				} else {
-					return false
+					return nil
 				}
 
-				tasks = []task{
-					{s.Start, true, "Start"},
-				}
-
-				return doTasks(tasks)
-
+				return doTasks([]task{
+					{func() error { return restartServiceTransaction(s, between) }, true, "Restart"},
+				})
 			}
 
 			if doRestart() {
@@ -1288,54 +1292,46 @@ func initUpgradeCmd() *cobra.Command {
 				if !svcInstalled {
 					return true
 				}
-				tasks := []task{
-					{s.Stop, true, "Stop"},
-					{func() error {
-						p.router.Cleanup()
-						// restore static DNS settings or DHCP
-						p.resetDNS(false, true)
-						return nil
-					}, false, "Cleanup"},
-					{func() error {
-						time.Sleep(time.Second * 1)
-						return nil
-					}, false, "Waiting for service to stop"},
-				}
-				if doTasks(tasks) {
+
+				between := func() error {
+					p.router.Cleanup()
+					// restore static DNS settings or DHCP
+					p.resetDNS(false, true)
+					time.Sleep(time.Second)
 
 					if router.WaitProcessExited() {
 						ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
 						defer cancel()
 
-					loop:
 						for {
 							select {
 							case <-ctx.Done():
-								mainLog.Load().Error().Msg("timeout while waiting for service to stop")
-								break loop
+								return fmt.Errorf("timeout while waiting for service to stop")
 							default:
 							}
-							time.Sleep(time.Second)
 							if status, _ := s.Status(); status == service.StatusStopped {
 								break
 							}
+							time.Sleep(time.Second)
 						}
 					}
+					return nil
 				}
 
-				tasks = []task{
-					{s.Start, true, "Start"},
+				if err := restartServiceTransaction(s, between); err != nil {
+					mainLog.Load().Error().Err(err).Msg("failed to restart ctrld service")
+					return false
 				}
-				if doTasks(tasks) {
-					if dir, err := socketDir(); err == nil {
-						if cc := newSocketControlClient(context.TODO(), s, dir); cc != nil {
-							_, _ = cc.post(ifacePath, nil)
-							return true
-						}
+
+				if dir, err := socketDir(); err == nil {
+					if cc := newSocketControlClient(context.TODO(), s, dir); cc != nil {
+						_, _ = cc.post(ifacePath, nil)
+						return true
 					}
 				}
 				return false
 			}
+
 			if svcInstalled {
 				mainLog.Load().Debug().Msg("Restarting ctrld service using new binary")
 			}
