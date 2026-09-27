@@ -76,3 +76,49 @@ func Test_merlinPostConfDoesNotExitHostHook(t *testing.T) {
 		t.Fatal("ctrld postconf block must not terminate the enclosing Merlin hook")
 	}
 }
+
+
+func Test_merlinLegacyMigrationPreservesPrependedContent(t *testing.T) {
+	legacy := strings.Join([]string{
+		"echo addon-before",
+		dnsmasq.CtrldMarker,
+		"#!/bin/sh",
+		"echo ctrld-legacy",
+		dnsmasq.MerlinPostConfMarker,
+		"echo addon-after",
+	}, "\n")
+	block := []byte("# BEGIN ctrld\necho ctrld-new\n# END ctrld")
+
+	got := string(merlinUpsertPostConf([]byte(legacy), block))
+	want := "echo addon-before\n# BEGIN ctrld\necho ctrld-new\n# END ctrld\necho addon-after"
+	if got != want {
+		t.Fatalf("legacy migration changed unrelated content or position:\nwant:\n%s\ngot:\n%s", want, got)
+	}
+}
+
+func Test_merlinUpsertPostConfKeepsExistingBlockPosition(t *testing.T) {
+	input := []byte("#!/bin/sh\n\necho addon-before\n# BEGIN ctrld\necho old\n# END ctrld\necho addon-after\n")
+	block := []byte("# BEGIN ctrld\necho new\n# END ctrld")
+
+	got := string(merlinUpsertPostConf(input, block))
+	want := "#!/bin/sh\n\necho addon-before\n# BEGIN ctrld\necho new\n# END ctrld\necho addon-after\n"
+	if got != want {
+		t.Fatalf("managed block moved relative to addon content:\nwant:\n%s\ngot:\n%s", want, got)
+	}
+}
+
+func Test_merlinParsePostConfPreservesLegacyPrefixAndSuffix(t *testing.T) {
+	input := strings.Join([]string{
+		"echo addon-before",
+		dnsmasq.CtrldMarker,
+		"#!/bin/sh",
+		"echo ctrld-legacy",
+		dnsmasq.MerlinPostConfMarker,
+		"echo addon-after",
+	}, "\n")
+	want := "echo addon-before\necho addon-after"
+
+	if got := string(merlinParsePostConf([]byte(input))); got != want {
+		t.Fatalf("legacy cleanup changed unrelated content:\nwant: %q\ngot:  %q", want, got)
+	}
+}
