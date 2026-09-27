@@ -601,3 +601,41 @@ func Test_cleanupPreparationRevalidatesBeforeWrite(t *testing.T) {
 	}
 }
 
+
+
+func Test_writeFileNoReplaceRefusesExistingTarget(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "dnsmasq.conf")
+	original := []byte("user-owned\n")
+	if err := os.WriteFile(path, original, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := writeFileNoReplace(path, []byte("ctrld-owned\n"), 0644); err == nil {
+		t.Fatal("expected no-replace publication to fail when target already exists")
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, original) {
+		t.Fatalf("existing target was modified:\nwant: %q\ngot:  %q", original, got)
+	}
+}
+
+func Test_writeFileNoReplacePublishesAbsentTarget(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "dnsmasq.conf")
+	want := []byte("ctrld-owned\n")
+
+	if err := writeFileNoReplace(path, want, 0644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("published target mismatch:\nwant: %q\ngot:  %q", want, got)
+	}
+}
