@@ -227,9 +227,18 @@ func (s *merlinSvc) Install() error {
 		return fmt.Errorf("s.template.Execute: %w", err)
 	}
 	startupPublished := false
-	existing, err := os.ReadFile(confPath)
+	startupInfo, statErr := os.Lstat(confPath)
 	switch {
-	case err == nil:
+	case statErr == nil:
+		// ctrld.startup is private to ctrld. Never follow a pre-existing symlink
+		// (or accept another special file) while running installer logic as root.
+		if !startupInfo.Mode().IsRegular() {
+			return fmt.Errorf("existing startup script is not a regular file: %s", confPath)
+		}
+		existing, err := os.ReadFile(confPath)
+		if err != nil {
+			return fmt.Errorf("read startup script: %w", err)
+		}
 		if !bytes.Equal(existing, rendered.Bytes()) {
 			return fmt.Errorf("already installed with different startup script: %s", confPath)
 		}
@@ -239,7 +248,7 @@ func (s *merlinSvc) Install() error {
 		if err := os.Chmod(confPath, 0755); err != nil {
 			return fmt.Errorf("os.Chmod: startup script: %w", err)
 		}
-	case os.IsNotExist(err):
+	case os.IsNotExist(statErr):
 		startupPublished, err = writeMerlinStartupScript(confPath, rendered.Bytes(), 0755)
 		if err != nil {
 			if startupPublished {
@@ -249,7 +258,7 @@ func (s *merlinSvc) Install() error {
 			return fmt.Errorf("publish startup script: %w", err)
 		}
 	default:
-		return fmt.Errorf("read startup script: %w", err)
+		return fmt.Errorf("lstat startup script: %w", statErr)
 	}
 
 	installComplete := false
