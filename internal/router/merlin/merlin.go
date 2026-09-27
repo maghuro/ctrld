@@ -226,6 +226,14 @@ func (m *Merlin) writeDnsmasqPostconf() error {
 }
 
 func writeMerlinHookUpdates(paths []string, block []byte) error {
+	return writeMerlinHookUpdatesWith(paths, block, atomicWriteFile)
+}
+
+func writeMerlinHookUpdatesWith(
+	paths []string,
+	block []byte,
+	writeFile func(string, []byte, os.FileMode) error,
+) error {
 	updates := make([]merlinHookUpdate, 0, len(paths))
 	for _, path := range paths {
 		update, err := prepareMerlinHookUpdate(path, block)
@@ -237,7 +245,7 @@ func writeMerlinHookUpdates(paths []string, block []byte) error {
 
 	written := make([]merlinHookUpdate, 0, len(updates))
 	for _, update := range updates {
-		if err := atomicWriteFile(update.path, update.data, 0750); err != nil {
+		if err := writeFile(update.path, update.data, 0750); err != nil {
 			if rollbackErr := rollbackMerlinHookUpdates(written); rollbackErr != nil {
 				return fmt.Errorf("write Merlin hook %s: %w; rollback failed: %v", update.path, err, rollbackErr)
 			}
