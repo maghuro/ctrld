@@ -2,8 +2,12 @@ package clientinfo
 
 import (
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/fsnotify/fsnotify"
 )
 
 func Test_readClientInfoReader(t *testing.T) {
@@ -137,5 +141,90 @@ func Test_dhcp_lookupIPByHostname(t *testing.T) {
 
 	if got := d.lookupIPByHostname("foo", false); got != want {
 		t.Fatalf("unexpected result, want: %s, got: %s", want, got)
+	}
+}
+
+
+func TestDynamicDnsmasqLeaseFileFormat(t *testing.T) {
+	tests := []struct {
+		name string
+		path string
+		ok   bool
+	}{
+		{"merlin sdn", "/var/lib/misc/dnsmasq-1.leases", true},
+		{"merlin later sdn", "/var/lib/misc/dnsmasq-123.leases", true},
+		{"edgeos dnsmasq", "/run/dnsmasq-dhcp.leases", true},
+		{"main dnsmasq", "/var/lib/misc/dnsmasq.leases", false},
+		{"unrelated lease", "/var/lib/misc/other.leases", false},
+		{"similar suffix", "/var/lib/misc/dnsmasq-1.leases.bak", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			format, ok := dynamicDnsmasqLeaseFileFormat(tc.path)
+			if ok != tc.ok {
+				t.Fatalf("dynamicDnsmasqLeaseFileFormat(%q) ok=%v, want %v", tc.path, ok, tc.ok)
+			}
+			if ok && format != "dnsmasq" {
+				t.Fatalf("dynamic format = %q, want dnsmasq", format)
+			}
+		})
+	}
+}
+
+
+func TestDiscoverDynamicLeaseFilesScansExistingFiles(t *testing.T) {
+	dir := t.TempDir()
+	lease := filepath.Join(dir, "dnsmasq-7.leases")
+	if err := os.WriteFile(lease, []byte("1683329857 e6:20:59:b8:c1:6d 192.168.1.186 host1 *\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "unrelated.leases"), []byte("ignored\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer watcher.Close()
+
+	d := &dhcp{watcher: watcher}
+	if err := d.discoverDynamicLeaseFiles(dir); err != nil {
+		t.Fatal(err)
+	}
+
+	format, ok := clientInfoFileFormat(lease)
+	if !ok || format != "dnsmasq" {
+		t.Fatalf("dynamic lease file was not registered: ok=%v format=%q", ok, format)
+	}
+	if got := d.LookupHostnameByMac("e6:20:59:b8:c1:6d"); got != "host1" {
+		t.Fatalf("hostname = %q, want host1", got)
+	}
+
+	// Keep the package-global registry isolated from subsequent tests.
+	clientInfoFilesMu.Lock()
+	delete(clientInfoFiles, lease)
+	clientInfoFilesMu.Unlock()
+}
+
+func TestDiscoverDynamicLeaseFilesIgnoresUnrelatedFiles(t *testing.T) {
+	dir := t.TempDir()
+	unrelated := filepath.Join(dir, "other.leases")
+	if err := os.WriteFile(unrelated, []byte("ignored\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer watcher.Close()
+
+	d := &dhcp{watcher: watcher}
+	if err := d.discoverDynamicLeaseFiles(dir); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := clientInfoFileFormat(unrelated); ok {
+		t.Fatalf("unrelated file was unexpectedly registered: %s", unrelated)
 	}
 }
