@@ -182,9 +182,19 @@ func (m *Merlin) Setup() (retErr error) {
 	return nil
 }
 
+const (
+	legacyCleanupPhase = "cleanup-v2"
+	legacyFinalizePhase = "finalize-v2"
+
+	legacyEntryPending = "pending"
+	legacyEntryDelete  = "delete"
+	legacyEntryRestore = "restore"
+)
+
 type legacySnapshotEntry struct {
-	path string
-	hash string
+	state string
+	path  string
+	hash  string
 }
 
 type legacyCleanupJournal struct {
@@ -237,41 +247,8 @@ func (m *Merlin) Cleanup() error {
 	}
 
 	if legacy {
-		switch journal.phase {
-		case "cleanup-v1":
-			// The exact snapshot paths and hashes were durably recorded before
-			// the first destructive operation. Retries consult only this journal,
-			// never a fresh directory enumeration, so a user-created replacement
-			// cannot be mistaken for ctrld's old snapshot.
-			for _, entry := range journal.entries {
-				buf, err := os.ReadFile(entry.path)
-				switch {
-				case err == nil:
-					if merlinSnapshotHash(buf) != entry.hash {
-						continue
-					}
-					if err := os.Remove(entry.path); err != nil && !os.IsNotExist(err) {
-						return fmt.Errorf("remove journaled legacy snapshot %s: %w", entry.path, err)
-					}
-				case os.IsNotExist(err):
-					// Already removed on a previous attempt.
-				default:
-					return fmt.Errorf("read journaled legacy snapshot %s: %w", entry.path, err)
-				}
-			}
-			if err := syncParentDir(dnsmasq.MerlinJffsConfDir); err != nil {
-				return fmt.Errorf("sync legacy snapshot directory: %w", err)
-			}
-			journal.phase = "finalize"
-			journal.entries = nil
-			if err := writeLegacyCleanupJournal(journal); err != nil {
-				return fmt.Errorf("advance Merlin legacy cleanup state: %w", err)
-			}
-		case "finalize":
-			// Destructive legacy cleanup already completed. A retry must never
-			// reinterpret newly created user files as legacy ctrld snapshots.
-		default:
-			return fmt.Errorf("unknown Merlin legacy cleanup phase %q", journal.phase)
+		if err := cleanupLegacySnapshots(&journal); err != nil {
+			return err
 		}
 	} else {
 		if err := cleanupOwnedMainSnapshot(); err != nil {
@@ -309,7 +286,7 @@ func buildLegacyCleanupJournal() (legacyCleanupJournal, error) {
 	}
 	paths = append(paths, matches...)
 
-	journal := legacyCleanupJournal{phase: "cleanup-v1"}
+	journal := legacyCleanupJournal{phase: legacyCleanupPhase}
 	for _, path := range paths {
 		if !isLegacySnapshotPath(path) {
 			continue
@@ -322,8 +299,9 @@ func buildLegacyCleanupJournal() (legacyCleanupJournal, error) {
 			return legacyCleanupJournal{}, fmt.Errorf("read legacy dnsmasq snapshot %s: %w", path, err)
 		}
 		journal.entries = append(journal.entries, legacySnapshotEntry{
-			path: path,
-			hash: merlinSnapshotHash(buf),
+			state: legacyEntryPending,
+			path:  path,
+			hash:  merlinSnapshotHash(buf),
 		})
 	}
 	return journal, nil
@@ -341,13 +319,29 @@ func encodeLegacyCleanupJournal(journal legacyCleanupJournal) ([]byte, error) {
 	var b strings.Builder
 	b.WriteString(journal.phase)
 	b.WriteByte('\n')
+	if journal.phase == legacyFinalizePhase {
+		if len(journal.entries) != 0 {
+			return nil, fmt.Errorf("finalize journal contains snapshot entries")
+		}
+		return []byte(b.String()), nil
+	}
+	if journal.phase != legacyCleanupPhase {
+		return nil, fmt.Errorf("unknown legacy cleanup phase %q", journal.phase)
+	}
 	for _, entry := range journal.entries {
 		if !isLegacySnapshotPath(entry.path) {
 			return nil, fmt.Errorf("invalid legacy snapshot path %q", entry.path)
 		}
+		switch entry.state {
+		case legacyEntryPending, legacyEntryDelete, legacyEntryRestore:
+		default:
+			return nil, fmt.Errorf("invalid legacy snapshot state %q for %s", entry.state, entry.path)
+		}
 		if _, err := hex.DecodeString(entry.hash); err != nil || len(entry.hash) != sha256.Size*2 {
 			return nil, fmt.Errorf("invalid legacy snapshot hash for %s", entry.path)
 		}
+		b.WriteString(entry.state)
+		b.WriteByte('\t')
 		b.WriteString(entry.path)
 		b.WriteByte('\t')
 		b.WriteString(entry.hash)
@@ -373,32 +367,235 @@ func parseLegacyCleanupJournal(buf []byte) (legacyCleanupJournal, error) {
 		return legacyCleanupJournal{}, fmt.Errorf("empty legacy cleanup journal")
 	}
 	journal := legacyCleanupJournal{phase: lines[0]}
-	if journal.phase == "finalize" {
+	if journal.phase == legacyFinalizePhase {
 		if len(lines) != 1 {
 			return legacyCleanupJournal{}, fmt.Errorf("finalize journal contains snapshot entries")
 		}
 		return journal, nil
 	}
-	if journal.phase != "cleanup-v1" {
+	if journal.phase != legacyCleanupPhase {
 		return legacyCleanupJournal{}, fmt.Errorf("unknown legacy cleanup phase %q", journal.phase)
 	}
 	for _, line := range lines[1:] {
 		if line == "" {
 			continue
 		}
-		parts := strings.SplitN(line, "\t", 2)
-		if len(parts) != 2 || !isLegacySnapshotPath(parts[0]) {
+		parts := strings.SplitN(line, "\t", 3)
+		if len(parts) != 3 || !isLegacySnapshotPath(parts[1]) {
 			return legacyCleanupJournal{}, fmt.Errorf("invalid legacy cleanup journal entry %q", line)
 		}
-		if len(parts[1]) != sha256.Size*2 {
-			return legacyCleanupJournal{}, fmt.Errorf("invalid legacy snapshot hash for %s", parts[0])
+		switch parts[0] {
+		case legacyEntryPending, legacyEntryDelete, legacyEntryRestore:
+		default:
+			return legacyCleanupJournal{}, fmt.Errorf("invalid legacy snapshot state %q", parts[0])
 		}
-		if _, err := hex.DecodeString(parts[1]); err != nil {
-			return legacyCleanupJournal{}, fmt.Errorf("invalid legacy snapshot hash for %s: %w", parts[0], err)
+		if len(parts[2]) != sha256.Size*2 {
+			return legacyCleanupJournal{}, fmt.Errorf("invalid legacy snapshot hash for %s", parts[1])
 		}
-		journal.entries = append(journal.entries, legacySnapshotEntry{path: parts[0], hash: parts[1]})
+		if _, err := hex.DecodeString(parts[2]); err != nil {
+			return legacyCleanupJournal{}, fmt.Errorf("invalid legacy snapshot hash for %s: %w", parts[1], err)
+		}
+		journal.entries = append(journal.entries, legacySnapshotEntry{state: parts[0], path: parts[1], hash: parts[2]})
 	}
 	return journal, nil
+}
+
+func legacySnapshotQuarantinePath(path string) string {
+	return filepath.Join(
+		dnsmasq.MerlinJffsConfDir,
+		"."+filepath.Base(path)+".ctrld-legacy-quarantine",
+	)
+}
+
+func removeLegacyJournalEntry(journal *legacyCleanupJournal, index int) error {
+	journal.entries = append(journal.entries[:index], journal.entries[index+1:]...)
+	return writeLegacyCleanupJournal(*journal)
+}
+
+func cleanupLegacySnapshots(journal *legacyCleanupJournal) error {
+	switch journal.phase {
+	case legacyFinalizePhase:
+		return nil
+	case legacyCleanupPhase:
+	default:
+		return fmt.Errorf("unknown Merlin legacy cleanup phase %q", journal.phase)
+	}
+
+	for len(journal.entries) > 0 {
+		entry := journal.entries[0]
+		var err error
+		switch entry.state {
+		case legacyEntryPending:
+			err = cleanupPendingLegacySnapshot(journal, 0)
+		case legacyEntryDelete:
+			err = finalizeLegacySnapshotDelete(journal, 0)
+		case legacyEntryRestore:
+			err = restoreLegacySnapshot(journal, 0)
+		default:
+			err = fmt.Errorf("unknown legacy snapshot state %q", entry.state)
+		}
+		if err != nil {
+			return err
+		}
+	}
+
+	journal.phase = legacyFinalizePhase
+	if err := writeLegacyCleanupJournal(*journal); err != nil {
+		return fmt.Errorf("advance Merlin legacy cleanup state: %w", err)
+	}
+	return nil
+}
+
+// cleanupPendingLegacySnapshot captures the exact pathname into a private
+// quarantine before deletion. The pre-rename FileInfo is compared with the
+// quarantined inode, so an atomic replacement between validation and rename is
+// detected even when the replacement has byte-identical contents.
+//
+// If a retry finds a quarantine while the durable entry is still "pending", the
+// previous attempt may have crashed after rename but before proving identity.
+// In that ambiguous state we restore rather than delete.
+func cleanupPendingLegacySnapshot(journal *legacyCleanupJournal, index int) error {
+	entry := journal.entries[index]
+	qpath := legacySnapshotQuarantinePath(entry.path)
+
+	qExists, err := pathExists(qpath)
+	if err != nil {
+		return err
+	}
+	if qExists {
+		journal.entries[index].state = legacyEntryRestore
+		if err := writeLegacyCleanupJournal(*journal); err != nil {
+			return fmt.Errorf("journal ambiguous legacy snapshot restoration: %w", err)
+		}
+		return restoreLegacySnapshot(journal, index)
+	}
+
+	f, err := os.Open(entry.path)
+	if os.IsNotExist(err) {
+		return removeLegacyJournalEntry(journal, index)
+	}
+	if err != nil {
+		return fmt.Errorf("open journaled legacy snapshot %s: %w", entry.path, err)
+	}
+	info, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		return fmt.Errorf("stat journaled legacy snapshot %s: %w", entry.path, err)
+	}
+	buf, err := io.ReadAll(f)
+	closeErr := f.Close()
+	if err != nil {
+		return fmt.Errorf("read journaled legacy snapshot %s: %w", entry.path, err)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("close journaled legacy snapshot %s: %w", entry.path, closeErr)
+	}
+	if merlinSnapshotHash(buf) != entry.hash {
+		// The path changed before ctrld touched it. It is no longer attributable
+		// to the old ctrld snapshot, so leave it untouched forever.
+		return removeLegacyJournalEntry(journal, index)
+	}
+
+	if err := os.Rename(entry.path, qpath); err != nil {
+		if os.IsNotExist(err) {
+			return removeLegacyJournalEntry(journal, index)
+		}
+		return fmt.Errorf("quarantine legacy snapshot %s: %w", entry.path, err)
+	}
+	if err := syncParentDir(dnsmasq.MerlinJffsConfDir); err != nil {
+		return fmt.Errorf("sync legacy snapshot quarantine: %w", err)
+	}
+
+	qInfo, err := os.Stat(qpath)
+	if err != nil {
+		return fmt.Errorf("stat quarantined legacy snapshot %s: %w", qpath, err)
+	}
+	qBuf, err := os.ReadFile(qpath)
+	if err != nil {
+		return fmt.Errorf("read quarantined legacy snapshot %s: %w", qpath, err)
+	}
+	if !os.SameFile(info, qInfo) || merlinSnapshotHash(qBuf) != entry.hash {
+		journal.entries[index].state = legacyEntryRestore
+		if err := writeLegacyCleanupJournal(*journal); err != nil {
+			return fmt.Errorf("journal replaced legacy snapshot restoration: %w", err)
+		}
+		return restoreLegacySnapshot(journal, index)
+	}
+
+	journal.entries[index].state = legacyEntryDelete
+	if err := writeLegacyCleanupJournal(*journal); err != nil {
+		return fmt.Errorf("journal legacy snapshot deletion: %w", err)
+	}
+	return finalizeLegacySnapshotDelete(journal, index)
+}
+
+func finalizeLegacySnapshotDelete(journal *legacyCleanupJournal, index int) error {
+	entry := journal.entries[index]
+	qpath := legacySnapshotQuarantinePath(entry.path)
+	qExists, err := pathExists(qpath)
+	if err != nil {
+		return err
+	}
+	if qExists {
+		buf, err := os.ReadFile(qpath)
+		if err != nil {
+			return fmt.Errorf("read quarantined legacy snapshot %s: %w", qpath, err)
+		}
+		if merlinSnapshotHash(buf) != entry.hash {
+			journal.entries[index].state = legacyEntryRestore
+			if err := writeLegacyCleanupJournal(*journal); err != nil {
+				return fmt.Errorf("journal modified legacy snapshot restoration: %w", err)
+			}
+			return restoreLegacySnapshot(journal, index)
+		}
+		if err := removeFileDurable(qpath); err != nil {
+			return fmt.Errorf("remove quarantined legacy snapshot %s: %w", qpath, err)
+		}
+	}
+	return removeLegacyJournalEntry(journal, index)
+}
+
+func restoreLegacySnapshot(journal *legacyCleanupJournal, index int) error {
+	entry := journal.entries[index]
+	qpath := legacySnapshotQuarantinePath(entry.path)
+	qExists, err := pathExists(qpath)
+	if err != nil {
+		return err
+	}
+	if !qExists {
+		// Either restoration/removal completed before a journal update failed or
+		// no destructive operation ever occurred. Never infer ownership from the
+		// public path on retry.
+		return removeLegacyJournalEntry(journal, index)
+	}
+
+	targetExists, err := pathExists(entry.path)
+	if err != nil {
+		return err
+	}
+	if targetExists {
+		same, err := sameFilePaths(entry.path, qpath)
+		if err != nil {
+			return err
+		}
+		if !same {
+			return fmt.Errorf(
+				"cannot restore captured legacy snapshot because %s was recreated; preserved capture at %s",
+				entry.path, qpath,
+			)
+		}
+	} else {
+		if err := os.Link(qpath, entry.path); err != nil {
+			return fmt.Errorf("restore captured legacy snapshot %s: %w", entry.path, err)
+		}
+	}
+	if err := syncParentDir(dnsmasq.MerlinJffsConfDir); err != nil {
+		return fmt.Errorf("sync restored legacy snapshot: %w", err)
+	}
+	if err := removeFileDurable(qpath); err != nil {
+		return fmt.Errorf("remove restored legacy snapshot quarantine: %w", err)
+	}
+	return removeLegacyJournalEntry(journal, index)
 }
 
 func isLegacySnapshotPath(path string) bool {
