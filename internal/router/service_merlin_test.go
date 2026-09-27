@@ -36,7 +36,7 @@ func TestMerlinServiceHookEditorIsIdempotent(t *testing.T) {
 	for _, want := range []string{
 		`if grep -qxF "$line" "$file"; then`,
 		`pc_append "$line" "$file"`,
-		`printf 'added\\n'`,
+		`printf 'added\n'`,
 	} {
 		if !strings.Contains(merlinAddLineToScript, want) {
 			t.Fatalf("hook editor missing idempotent append signal %q", want)
