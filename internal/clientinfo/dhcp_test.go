@@ -139,3 +139,30 @@ func Test_dhcp_lookupIPByHostname(t *testing.T) {
 		t.Fatalf("unexpected result, want: %s, got: %s", want, got)
 	}
 }
+
+
+func TestDynamicDnsmasqLeaseFileFormat(t *testing.T) {
+	tests := []struct {
+		name string
+		path string
+		ok   bool
+	}{
+		{"merlin sdn", "/var/lib/misc/dnsmasq-1.leases", true},
+		{"merlin later sdn", "/var/lib/misc/dnsmasq-123.leases", true},
+		{"edgeos dnsmasq", "/run/dnsmasq-dhcp.leases", true},
+		{"main dnsmasq", "/var/lib/misc/dnsmasq.leases", false},
+		{"unrelated lease", "/var/lib/misc/other.leases", false},
+		{"similar suffix", "/var/lib/misc/dnsmasq-1.leases.bak", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			format, ok := dynamicDnsmasqLeaseFileFormat(tc.path)
+			if ok != tc.ok {
+				t.Fatalf("dynamicDnsmasqLeaseFileFormat(%q) ok=%v, want %v", tc.path, ok, tc.ok)
+			}
+			if ok && format != "dnsmasq" {
+				t.Fatalf("dynamic format = %q, want dnsmasq", format)
+			}
+		})
+	}
+}
