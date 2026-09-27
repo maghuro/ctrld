@@ -284,7 +284,7 @@ func (m *Merlin) Cleanup() error {
 
 	// Restore NVRAM only after ctrld-owned artifacts are cleaned successfully.
 	if setupVal == "1" {
-		if err := nvram.Restore(nvramKvMap, nvram.CtrldSetupKey); err != nil {
+		if err := nvram.RestoreWithVolatileRetryMarker(nvramKvMap, nvram.CtrldSetupKey); err != nil {
 			return err
 		}
 	}
