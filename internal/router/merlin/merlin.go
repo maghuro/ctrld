@@ -272,30 +272,105 @@ func getDnsmasqConfigs() []*dnsmasqConfig {
 	return cfgs
 }
 
+// merlinExactLineBounds finds marker only when it occupies a complete line.
+// The returned end excludes the line ending so callers can decide whether to
+// preserve or consume that separator.
+func merlinExactLineBounds(buf, marker []byte, from int) (start, end int, ok bool) {
+	if from < 0 {
+		from = 0
+	}
+	for pos := from; pos <= len(buf); {
+		lineStart := pos
+		relNL := bytes.IndexByte(buf[pos:], '\n')
+		lineEnd := len(buf)
+		next := len(buf) + 1
+		if relNL >= 0 {
+			lineEnd = pos + relNL
+			next = lineEnd + 1
+		}
+
+		contentEnd := lineEnd
+		if contentEnd > lineStart && buf[contentEnd-1] == '\r' {
+			contentEnd--
+		}
+		if bytes.Equal(buf[lineStart:contentEnd], marker) {
+			return lineStart, lineEnd, true
+		}
+
+		if relNL < 0 {
+			break
+		}
+		pos = next
+	}
+	return 0, 0, false
+}
+
+// merlinLastExactLineBefore returns the last complete marker line starting
+// before limit.
+func merlinLastExactLineBefore(buf, marker []byte, limit int) (start, end int, ok bool) {
+	from := 0
+	for {
+		s, e, found := merlinExactLineBounds(buf, marker, from)
+		if !found || s >= limit {
+			break
+		}
+		start, end, ok = s, e, true
+		if e >= len(buf) {
+			break
+		}
+		from = e + 1
+	}
+	return start, end, ok
+}
+
 // merlinPostConfBlock returns the ctrld-owned block bounds.
 // It understands both the current BEGIN/END format and the legacy <= 1.5.7
-// GENERATED/EOF format. Legacy matching is deliberately bounded by the known
-// ctrld header so content prepended by another addon is not treated as ours.
+// GENERATED/EOF format. Markers must occupy complete lines so shell variables,
+// comments or unrelated strings containing the marker text are never claimed.
 func merlinPostConfBlock(buf []byte) (start, end int, ok bool) {
 	begin := []byte(dnsmasq.MerlinPostConfBeginMarker)
 	endMarker := []byte(dnsmasq.MerlinPostConfEndMarker)
-	if start = bytes.Index(buf, begin); start >= 0 {
-		relEnd := bytes.Index(buf[start+len(begin):], endMarker)
-		if relEnd >= 0 {
-			end = start + len(begin) + relEnd + len(endMarker)
-			return start, end, true
+	if blockStart, beginEnd, found := merlinExactLineBounds(buf, begin, 0); found {
+		from := beginEnd
+		if from < len(buf) && buf[from] == '\n' {
+			from++
+		}
+		if blockEndStart, blockEnd, foundEnd := merlinExactLineBounds(buf, endMarker, from); foundEnd {
+			_ = blockEndStart
+			return blockStart, blockEnd, true
 		}
 	}
 
 	legacyEnd := []byte(dnsmasq.MerlinPostConfMarker)
-	if marker := bytes.Index(buf, legacyEnd); marker >= 0 {
+	if legacyEndStart, legacyEndEnd, found := merlinExactLineBounds(buf, legacyEnd, 0); found {
 		legacyBegin := []byte(dnsmasq.CtrldMarker)
-		if relStart := bytes.LastIndex(buf[:marker], legacyBegin); relStart >= 0 {
-			return relStart, marker + len(legacyEnd), true
+		if legacyBeginStart, _, foundBegin := merlinLastExactLineBefore(buf, legacyBegin, legacyEndStart); foundBegin {
+			return legacyBeginStart, legacyEndEnd, true
 		}
 	}
 
 	return 0, 0, false
+}
+
+func merlinConsumeLineEnding(buf []byte, pos int) int {
+	if pos >= len(buf) {
+		return pos
+	}
+	if buf[pos] == '\r' {
+		pos++
+		if pos < len(buf) && buf[pos] == '\n' {
+			pos++
+		}
+		return pos
+	}
+	if buf[pos] == '\n' {
+		return pos + 1
+	}
+	return pos
+}
+
+func merlinHasBlankLineSuffix(buf []byte) bool {
+	return bytes.HasSuffix(buf, []byte("\n\n")) || bytes.HasSuffix(buf, []byte("\r\n\r\n"))
 }
 
 // merlinParsePostConf removes only ctrld-owned postconf content while preserving
@@ -309,15 +384,24 @@ func merlinParsePostConf(buf []byte) []byte {
 		return buf
 	}
 
-	out := make([]byte, 0, len(buf)-(end-start))
+	// The ctrld block owns the line ending immediately following its END/EOF
+	// marker. Older ctrld-generated hooks also placed a blank separator around
+	// the managed block; consume that second separator only when the prefix
+	// already ends in a blank line, restoring the original hook byte-for-byte.
+	after := merlinConsumeLineEnding(buf, end)
+	if merlinHasBlankLineSuffix(buf[:start]) {
+		after = merlinConsumeLineEnding(buf, after)
+	}
+
+	out := make([]byte, 0, len(buf)-(after-start))
 	out = append(out, buf[:start]...)
-	out = append(out, buf[end:]...)
-	return bytes.TrimRight(out, "\r\n")
+	out = append(out, buf[after:]...)
+	return out
 }
 
 // merlinUpsertPostConf replaces an existing ctrld block in place, preserving
-// ordering relative to other addons. On first install, it places ctrld directly
-// after an existing shebang, or creates a shell shebang if one is absent.
+// ordering relative to other addons. On first install it inserts directly after
+// an existing shebang. Cleanup can therefore restore the original bytes.
 func merlinUpsertPostConf(buf, block []byte) []byte {
 	if start, end, ok := merlinPostConfBlock(buf); ok {
 		out := make([]byte, 0, len(buf)-(end-start)+len(block))
@@ -327,29 +411,25 @@ func merlinUpsertPostConf(buf, block []byte) []byte {
 		return out
 	}
 
-	clean := bytes.TrimRight(buf, "\r\n")
-	if len(clean) == 0 {
-		return []byte("#!/bin/sh\n\n" + string(block) + "\n")
+	if len(buf) == 0 {
+		return []byte("#!/bin/sh\n" + string(block) + "\n")
 	}
 
-	if bytes.HasPrefix(clean, []byte("#!")) {
-		if nl := bytes.IndexByte(clean, '\n'); nl >= 0 {
-			head := clean[:nl+1]
-			rest := clean[nl+1:]
-			out := make([]byte, 0, len(clean)+len(block)+4)
-			out = append(out, head...)
-			out = append(out, '\n')
+	if bytes.HasPrefix(buf, []byte("#!")) {
+		if nl := bytes.IndexByte(buf, '\n'); nl >= 0 {
+			out := make([]byte, 0, len(buf)+len(block)+1)
+			out = append(out, buf[:nl+1]...)
 			out = append(out, block...)
-			if len(rest) > 0 {
-				out = append(out, '\n')
-				out = append(out, rest...)
-			}
 			out = append(out, '\n')
+			out = append(out, buf[nl+1:]...)
 			return out
 		}
 	}
 
-	return []byte("#!/bin/sh\n\n" + string(block) + "\n\n" + string(clean) + "\n")
+	// Existing hook without a shebang: preserve its content verbatim after a
+	// shell shebang and the ctrld block. This is the only case where ctrld must
+	// add wrapper bytes so the hook remains directly executable by Merlin.
+	return []byte("#!/bin/sh\n" + string(block) + "\n" + string(buf))
 }
 
 // atomicWriteFile replaces path only after a complete sibling temporary file
