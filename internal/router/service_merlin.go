@@ -273,16 +273,29 @@ func (s *merlinSvc) Run() (err error) {
 func (s *merlinSvc) Status() (service.Status, error) {
 	if _, err := os.Stat(s.configPath()); os.IsNotExist(err) {
 		return service.StatusUnknown, service.ErrNotInstalled
-	}
-	out, err := exec.Command(s.configPath(), "status").CombinedOutput()
-	if err != nil {
+	} else if err != nil {
 		return service.StatusUnknown, err
 	}
+	out, err := exec.Command(s.configPath(), "status").CombinedOutput()
+	return merlinServiceStatus(out, err)
+}
+
+func merlinServiceStatus(out []byte, cmdErr error) (service.Status, error) {
 	switch string(bytes.TrimSpace(out)) {
 	case "running":
+		if cmdErr != nil {
+			return service.StatusUnknown, cmdErr
+		}
 		return service.StatusRunning, nil
-	default:
+	case "stopped":
+		// The generated BusyBox script intentionally exits 1 for "stopped".
+		// That is a state, not a failure to determine the state.
 		return service.StatusStopped, nil
+	default:
+		if cmdErr != nil {
+			return service.StatusUnknown, cmdErr
+		}
+		return service.StatusUnknown, fmt.Errorf("unexpected Merlin service status output: %q", bytes.TrimSpace(out))
 	}
 }
 
