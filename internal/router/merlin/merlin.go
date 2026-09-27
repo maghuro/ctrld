@@ -280,6 +280,22 @@ func (m *Merlin) Cleanup() error {
 }
 
 func buildLegacyCleanupJournal() (legacyCleanupJournal, error) {
+	// A quarantine is meaningful only together with a durable journal. Never
+	// adopt an unjournaled private-looking pathname as ctrld-owned data.
+	orphans, err := filepath.Glob(filepath.Join(
+		dnsmasq.MerlinJffsConfDir,
+		".dnsmasq*.ctrld-legacy-quarantine",
+	))
+	if err != nil {
+		return legacyCleanupJournal{}, err
+	}
+	if len(orphans) != 0 {
+		return legacyCleanupJournal{}, fmt.Errorf(
+			"unjournaled Merlin legacy quarantine requires manual reconciliation: %s",
+			strings.Join(orphans, ", "),
+		)
+	}
+
 	paths := []string{dnsmasq.MerlinJffsConfPath}
 	matches, err := filepath.Glob(filepath.Join(dnsmasq.MerlinJffsConfDir, "dnsmasq-*.conf"))
 	if err != nil {
