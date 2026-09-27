@@ -426,7 +426,26 @@ func merlinParsePostConf(buf []byte) []byte {
 // required shell shebang. Pre-existing hooks are validated before this helper is
 // called, so no synthetic wrapper is ever added to third-party content.
 func merlinUpsertPostConf(buf, block []byte) []byte {
-	if start, end, _, ok := merlinPostConfBlock(buf); ok {
+	if start, end, kind, ok := merlinPostConfBlock(buf); ok {
+		if kind == merlinPostConfBlockLegacy {
+			after := end
+			for i := 0; i < 3; i++ {
+				next := merlinConsumeLineEnding(buf, after)
+				if next == after {
+					break
+				}
+				after = next
+			}
+			out := make([]byte, 0, len(buf)-(after-start)+len(block)+1)
+			out = append(out, buf[:start]...)
+			out = append(out, block...)
+			if after < len(buf) {
+				out = append(out, '\n')
+			}
+			out = append(out, buf[after:]...)
+			return out
+		}
+
 		out := make([]byte, 0, len(buf)-(end-start)+len(block))
 		out = append(out, buf[:start]...)
 		out = append(out, block...)
