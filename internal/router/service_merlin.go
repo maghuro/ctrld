@@ -128,6 +128,14 @@ func refreshMerlinStartupScriptForExecutable(exePath string) error {
 	})
 }
 
+type merlinStartupMigrationError struct {
+	err    error
+	legacy []byte
+}
+
+func (e *merlinStartupMigrationError) Error() string { return e.err.Error() }
+func (e *merlinStartupMigrationError) Unwrap() error { return e.err }
+
 func (s *merlinSvc) refreshMerlinStartupScript() error {
 	exePath := s.Config.Executable
 	if exePath == "" {
@@ -173,7 +181,10 @@ func (s *merlinSvc) refreshMerlinStartupScript() error {
 	}
 	exists, err = prepareExistingMerlinStartupScript(s.configPath(), current, legacy)
 	if err != nil {
-		return err
+		return &merlinStartupMigrationError{
+			err:    err,
+			legacy: append([]byte(nil), legacy...),
+		}
 	}
 	if !exists {
 		return service.ErrNotInstalled
@@ -638,7 +649,24 @@ func (s *merlinSvc) startLocked() error {
 	// an exact ctrld-owned legacy startup script here as a secondary path; the
 	// newly launched binary also performs this migration from ctrld run.
 	if err := s.refreshMerlinStartupScript(); err != nil {
-		return err
+		var migrationErr *merlinStartupMigrationError
+		if !errors.As(err, &migrationErr) {
+			return err
+		}
+
+		// Migration can fail before publication because JFFS is full/read-only or
+		// reports an I/O error. The exact legacy script is intentionally left
+		// intact in that case. Re-read it before fallback; if it is still the
+		// recognized legacy bytes (or the migration actually published the
+		// current marked script before a durability error), start it rather than
+		// leaving DNS down. Anything else remains a hard error.
+		installed, exists, readErr := readExistingMerlinStartupScript(s.configPath())
+		if readErr != nil {
+			return errors.Join(err, readErr)
+		}
+		if !exists || (!bytes.Equal(installed, migrationErr.legacy) && !merlinStartupScriptHasMarker(installed)) {
+			return err
+		}
 	}
 	return exec.Command(s.configPath(), "start").Run()
 }
