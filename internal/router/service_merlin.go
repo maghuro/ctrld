@@ -279,9 +279,10 @@ func (s *merlinSvc) Install() error {
 		created bool
 		added   bool
 	}
+	startupPath := merlinShellQuote(s.configPath())
 	hooks := []hookLine{
-		{script: merlinJFFSScriptPath, line: s.configPath() + " start"},
-		{script: merlinJFFSServiceEventScriptPath, line: s.configPath() + ` service_event "$1" "$2"`},
+		{script: merlinJFFSScriptPath, line: startupPath + " start"},
+		{script: merlinJFFSServiceEventScriptPath, line: startupPath + ` service_event "$1" "$2"`},
 	}
 	installed := make([]hookLine, 0, len(hooks))
 	for _, hook := range hooks {
@@ -342,9 +343,10 @@ func (s *merlinSvc) Uninstall() error {
 		return nil
 	}
 
+	startupPath := merlinShellQuote(s.configPath())
 	for script, line := range map[string]string{
-		merlinJFFSScriptPath:             s.configPath() + " start",
-		merlinJFFSServiceEventScriptPath: s.configPath() + ` service_event "$1" "$2"`,
+		merlinJFFSScriptPath:             startupPath + " start",
+		merlinJFFSServiceEventScriptPath: startupPath + ` service_event "$1" "$2"`,
 	} {
 		if err := removeLineFromScript(line, script); err != nil {
 			return err
