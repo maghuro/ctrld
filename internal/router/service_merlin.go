@@ -222,14 +222,14 @@ func (s *merlinSvc) Install() error {
 		}
 	}
 
-	addLineToScript := func(line, script string) (created bool, retErr error) {
+	addLineToScript := func(line, script string) (created, added bool, retErr error) {
 		if _, err := os.Stat(script); os.IsNotExist(err) {
 			if err := os.WriteFile(script, []byte("#!/bin/sh\n"), 0755); err != nil {
-				return false, err
+				return false, false, err
 			}
 			created = true
 		} else if err != nil {
-			return false, err
+			return false, false, err
 		}
 		defer func() {
 			if retErr != nil && created {
@@ -238,17 +238,28 @@ func (s *merlinSvc) Install() error {
 		}()
 
 		// A pre-existing shared hook owns its mode. Do not chmod it as a side
-		// effect of installing ctrld.
-		if err := exec.Command("sh", tmpScript.Name(), line, script, "add").Run(); err != nil {
-			return created, fmt.Errorf("exec.Command: add startup script: %w", err)
+		// effect of installing ctrld. The editor reports whether this invocation
+		// actually appended the line so rollback never removes a pre-existing
+		// ctrld hook line.
+		out, err := exec.Command("sh", tmpScript.Name(), line, script, "add").CombinedOutput()
+		if err != nil {
+			return created, false, fmt.Errorf("exec.Command: add startup script: %s: %w", strings.TrimSpace(string(out)), err)
 		}
-		return created, nil
+		switch strings.TrimSpace(string(out)) {
+		case "":
+			return created, false, nil
+		case "added":
+			return created, true, nil
+		default:
+			return created, false, fmt.Errorf("unexpected hook editor output: %q", strings.TrimSpace(string(out)))
+		}
 	}
 
 	type hookLine struct {
 		script  string
 		line    string
 		created bool
+		added   bool
 	}
 	hooks := []hookLine{
 		{script: merlinJFFSScriptPath, line: s.configPath() + " start"},
@@ -256,7 +267,7 @@ func (s *merlinSvc) Install() error {
 	}
 	installed := make([]hookLine, 0, len(hooks))
 	for _, hook := range hooks {
-		created, err := addLineToScript(hook.line, hook.script)
+		created, added, err := addLineToScript(hook.line, hook.script)
 		if err != nil {
 			// Best-effort rollback: remove only lines successfully installed by
 			// this attempt. Shared hook files created by ctrld are removed again;
@@ -267,11 +278,14 @@ func (s *merlinSvc) Install() error {
 					cleanupCreatedHook(prev.line, prev.script)
 					continue
 				}
-				_ = exec.Command("sh", tmpScript.Name(), prev.line, prev.script, "remove").Run()
+				if prev.added {
+					_ = exec.Command("sh", tmpScript.Name(), prev.line, prev.script, "remove").Run()
+				}
 			}
 			return err
 		}
 		hook.created = created
+		hook.added = added
 		installed = append(installed, hook)
 	}
 
@@ -523,7 +537,11 @@ if [ "$mode" = "remove" ]; then
   pattern=$(_quote "$line")
   sed -i "/^$pattern$/d" "$file"
 else
-  grep -qxF "$line" "$file" || pc_append "$line" "$file"
+  if grep -qxF "$line" "$file"; then
+    exit 0
+  fi
+  pc_append "$line" "$file"
+  printf 'added\n'
 fi
 `
 
