@@ -36,10 +36,6 @@ var nvramKvMap = map[string]string{
 }
 
 // dnsmasqConfig represents configuration paths for dnsmasq operations in Merlin firmware.
-type dnsmasqConfig struct {
-	confPath     string
-	jffsConfPath string
-}
 
 // Merlin represents a configuration handler for setting up and managing ctrld on Merlin routers.
 type Merlin struct {
@@ -1002,15 +998,6 @@ func finalizeRestoredMainSnapshot() error {
 	return cleanupSnapshotPrivateState()
 }
 
-// cleanupDnsmasqJffs removes the JFFS configuration file specified in the given dnsmasqConfig, if it exists.
-func (m *Merlin) cleanupDnsmasqJffs(cfg *dnsmasqConfig) error {
-	// Remove cfg.jffsConfPath file.
-	if err := os.Remove(cfg.jffsConfPath); err != nil && !os.IsNotExist(err) {
-		return err
-	}
-	return nil
-}
-
 // merlinHookUpdate is prepared entirely before any shared hook is modified.
 // This lets us validate/read both Merlin hook paths before the first write.
 type merlinHookUpdate struct {
@@ -1243,19 +1230,6 @@ func restartDNSMasq() error {
 		return fmt.Errorf("restart_dnsmasq: %s, %w", string(out), err)
 	}
 	return nil
-}
-
-// getDnsmasqConfigs retrieves a list of dnsmasqConfig containing configuration and JFFS paths for dnsmasq operations.
-func getDnsmasqConfigs() []*dnsmasqConfig {
-	cfgs := []*dnsmasqConfig{
-		{dnsmasq.MerlinConfPath, dnsmasq.MerlinJffsConfPath},
-	}
-	for _, path := range dnsmasq.AdditionalConfigFiles() {
-		jffsConfPath := filepath.Join(dnsmasq.MerlinJffsConfDir, filepath.Base(path))
-		cfgs = append(cfgs, &dnsmasqConfig{path, jffsConfPath})
-	}
-
-	return cfgs
 }
 
 // merlinExactLineBounds finds marker only when it occupies a complete line.
