@@ -195,46 +195,65 @@ func (m *Merlin) cleanupDnsmasqJffs(cfg *dnsmasqConfig) error {
 	return nil
 }
 
-// writeDnsmasqPostconf installs ctrld-owned blocks in Merlin's main and SDN hooks while preserving unrelated content.
+// merlinHookUpdate is prepared entirely before any shared hook is modified.
+// This lets us validate/read both Merlin hook paths before the first write.
+type merlinHookUpdate struct {
+	path string
+	data []byte
+}
+
+// writeDnsmasqPostconf installs ctrld-owned blocks in Merlin's main and SDN
+// hooks while preserving unrelated content. Both paths are preflighted before
+// either is modified, avoiding a half-installed integration when the second
+// shared hook is unreadable or otherwise invalid.
 func (m *Merlin) writeDnsmasqPostconf() error {
-	for _, path := range []string{dnsmasq.MerlinPostConfPath, dnsmasq.MerlinSdnPostConfPath} {
-		if err := m.writeDnsmasqPostconfFile(path); err != nil {
+	data, err := dnsmasq.ConfTmpl(dnsmasq.MerlinPostConfTmpl, m.cfg)
+	if err != nil {
+		return err
+	}
+	block := []byte(strings.Join([]string{
+		dnsmasq.MerlinPostConfBeginMarker,
+		strings.TrimSpace(data),
+		dnsmasq.MerlinPostConfEndMarker,
+	}, "\n"))
+
+	paths := []string{dnsmasq.MerlinPostConfPath, dnsmasq.MerlinSdnPostConfPath}
+	updates := make([]merlinHookUpdate, 0, len(paths))
+	for _, path := range paths {
+		update, err := prepareMerlinHookUpdate(path, block)
+		if err != nil {
+			return err
+		}
+		updates = append(updates, update)
+	}
+
+	for _, update := range updates {
+		if err := atomicWriteFile(update.path, update.data, 0750); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (m *Merlin) writeDnsmasqPostconfFile(path string) error {
+func prepareMerlinHookUpdate(path string, block []byte) (merlinHookUpdate, error) {
 	_, statErr := os.Lstat(path)
 	pathMissing := os.IsNotExist(statErr)
 	if statErr != nil && !pathMissing {
-		return statErr
+		return merlinHookUpdate{}, statErr
 	}
 
 	buf, err := os.ReadFile(path)
 	if err != nil {
 		if !pathMissing || !os.IsNotExist(err) {
-			return err
+			return merlinHookUpdate{}, err
 		}
 		buf = nil
 	}
-	if !pathMissing && !merlinExistingHookHasValidShebang(buf) {
-		return fmt.Errorf("refusing to modify existing Merlin hook without a newline-terminated shebang: %s", path)
-	}
 
-	data, err := dnsmasq.ConfTmpl(dnsmasq.MerlinPostConfTmpl, m.cfg)
-	if err != nil {
-		return err
-	}
-
-	block := strings.Join([]string{
-		dnsmasq.MerlinPostConfBeginMarker,
-		strings.TrimSpace(data),
-		dnsmasq.MerlinPostConfEndMarker,
-	}, "\n")
-
-	return atomicWriteFile(path, merlinUpsertPostConf(buf, []byte(block)), 0750)
+	return merlinHookUpdate{
+		path: path,
+		data: merlinUpsertPostConf(buf, block),
+	}, nil
 }
 
 func cleanupDnsmasqPostconf(path string) error {
@@ -249,7 +268,7 @@ func cleanupDnsmasqPostconf(path string) error {
 	clean := merlinParsePostConf(buf)
 	// Never delete a shared Merlin hook outright. We cannot safely prove
 	// persistent ownership across addon rewrites/reboots, so cleanup removes
-	// only ctrld's block and leaves any resulting stub in place.
+	// only ctrld-owned bytes and leaves any resulting stub in place.
 	return atomicWriteFile(path, clean, 0750)
 }
 
@@ -273,13 +292,6 @@ func getDnsmasqConfigs() []*dnsmasqConfig {
 	}
 
 	return cfgs
-}
-
-// merlinExistingHookHasValidShebang reports whether a pre-existing shared
-// Merlin hook can be extended without synthesizing wrapper bytes that cleanup
-// could not later prove belong to ctrld.
-func merlinExistingHookHasValidShebang(buf []byte) bool {
-	return bytes.HasPrefix(buf, []byte("#!")) && bytes.IndexByte(buf, '\n') >= 0
 }
 
 // merlinExactLineBounds finds marker only when it occupies a complete line.
@@ -386,8 +398,35 @@ func merlinConsumeLineEnding(buf []byte, pos int) int {
 	return pos
 }
 
+func merlinBlockHasSyntheticShebang(buf []byte, start, end int) bool {
+	if start < 0 || end < start || end > len(buf) {
+		return false
+	}
+	_, _, ok := merlinExactLineBounds(
+		buf[start:end],
+		[]byte(dnsmasq.MerlinSyntheticShebangMarker),
+		0,
+	)
+	return ok
+}
+
+func merlinBlockWithSyntheticShebang(block []byte) []byte {
+	prefix := []byte(dnsmasq.MerlinPostConfBeginMarker + "\n")
+	if !bytes.HasPrefix(block, prefix) {
+		return block
+	}
+	out := make([]byte, 0, len(block)+len(dnsmasq.MerlinSyntheticShebangMarker)+1)
+	out = append(out, prefix...)
+	out = append(out, dnsmasq.MerlinSyntheticShebangMarker...)
+	out = append(out, '\n')
+	out = append(out, block[len(prefix):]...)
+	return out
+}
+
 // merlinParsePostConf removes only ctrld-owned postconf content while preserving
-// unrelated hook logic before and after it.
+// unrelated hook logic before and after it. If ctrld had to synthesize the
+// leading shebang for a pre-existing hook without one, that shebang is marked
+// inside ctrld's block and removed together with the block.
 func merlinParsePostConf(buf []byte) []byte {
 	if len(buf) == 0 {
 		return nil
@@ -397,11 +436,12 @@ func merlinParsePostConf(buf []byte) []byte {
 		return buf
 	}
 
+	syntheticShebang := kind == merlinPostConfBlockCurrent &&
+		merlinBlockHasSyntheticShebang(buf, start, end)
+
 	// Current blocks own the line ending following END. ctrld <= 1.5.7 wrote
 	// its legacy wrapper with strings.Join(..., "\n"), producing three line
-	// endings between the EOF marker and the previously existing hook. Consume
-	// exactly those historical separators so the preserved hook returns to its
-	// original byte position, including a shebang at byte zero.
+	// endings between the EOF marker and the previously existing hook.
 	separatorCount := 1
 	if kind == merlinPostConfBlockLegacy {
 		separatorCount = 3
@@ -415,59 +455,87 @@ func merlinParsePostConf(buf []byte) []byte {
 		after = next
 	}
 
+	if syntheticShebang {
+		const shebang = "#!/bin/sh\n"
+		if start == len(shebang) && bytes.Equal(buf[:start], []byte(shebang)) {
+			start = 0
+		}
+	}
+
 	out := make([]byte, 0, len(buf)-(after-start))
 	out = append(out, buf[:start]...)
 	out = append(out, buf[after:]...)
 	return out
 }
 
-// merlinUpsertPostConf replaces an existing ctrld block in place, preserving
-// ordering relative to other addons. For a newly created hook it supplies the
-// required shell shebang. Pre-existing hooks are validated before this helper is
-// called, so no synthetic wrapper is ever added to third-party content.
+// merlinUpsertPostConf replaces an existing ctrld block in place. New hooks,
+// and existing hooks that do not already start with a usable shebang, receive a
+// ctrld-owned synthetic shebang. The ownership marker lives inside the managed
+// block so cleanup can remove that wrapper and restore the original bytes.
 func merlinUpsertPostConf(buf, block []byte) []byte {
 	if start, end, kind, ok := merlinPostConfBlock(buf); ok {
-		if kind == merlinPostConfBlockLegacy {
-			after := end
-			for i := 0; i < 3; i++ {
-				next := merlinConsumeLineEnding(buf, after)
-				if next == after {
-					break
-				}
-				after = next
+		if kind == merlinPostConfBlockCurrent {
+			if merlinBlockHasSyntheticShebang(buf, start, end) {
+				block = merlinBlockWithSyntheticShebang(block)
 			}
-			out := make([]byte, 0, len(buf)-(after-start)+len(block)+1)
+			out := make([]byte, 0, len(buf)-(end-start)+len(block))
 			out = append(out, buf[:start]...)
 			out = append(out, block...)
-			if after < len(buf) {
-				out = append(out, '\n')
+			out = append(out, buf[end:]...)
+			return out
+		}
+
+		// Legacy ctrld <= 1.5.7 wrote three separators after its EOF marker.
+		after := end
+		for i := 0; i < 3; i++ {
+			next := merlinConsumeLineEnding(buf, after)
+			if next == after {
+				break
 			}
+			after = next
+		}
+
+		if start == 0 {
+			marked := merlinBlockWithSyntheticShebang(block)
+			out := make([]byte, 0, len(marked)+len(buf[after:])+16)
+			out = append(out, "#!/bin/sh\n"...)
+			out = append(out, marked...)
+			out = append(out, '\n')
 			out = append(out, buf[after:]...)
 			return out
 		}
 
-		out := make([]byte, 0, len(buf)-(end-start)+len(block))
+		out := make([]byte, 0, len(buf)-(after-start)+len(block)+1)
 		out = append(out, buf[:start]...)
 		out = append(out, block...)
-		out = append(out, buf[end:]...)
+		if after < len(buf) {
+			out = append(out, '\n')
+		}
+		out = append(out, buf[after:]...)
 		return out
 	}
 
-	if len(buf) == 0 {
-		return []byte("#!/bin/sh\n" + string(block) + "\n")
+	// Preserve a valid existing shebang and inject directly after it.
+	if bytes.HasPrefix(buf, []byte("#!")) {
+		if nl := bytes.IndexByte(buf, '\n'); nl >= 0 {
+			out := make([]byte, 0, len(buf)+len(block)+1)
+			out = append(out, buf[:nl+1]...)
+			out = append(out, block...)
+			out = append(out, '\n')
+			out = append(out, buf[nl+1:]...)
+			return out
+		}
 	}
 
-	if nl := bytes.IndexByte(buf, '\n'); nl >= 0 {
-		out := make([]byte, 0, len(buf)+len(block)+1)
-		out = append(out, buf[:nl+1]...)
-		out = append(out, block...)
-		out = append(out, '\n')
-		out = append(out, buf[nl+1:]...)
-		return out
-	}
-
-	// writeDnsmasqPostconfFile rejects this case for pre-existing hooks.
-	return buf
+	// Missing/empty/non-shebang hooks are still safe to extend: the synthetic
+	// wrapper is explicitly marked as ctrld-owned and cleanup removes it.
+	marked := merlinBlockWithSyntheticShebang(block)
+	out := make([]byte, 0, len(buf)+len(marked)+16)
+	out = append(out, "#!/bin/sh\n"...)
+	out = append(out, marked...)
+	out = append(out, '\n')
+	out = append(out, buf...)
+	return out
 }
 
 // atomicWriteFile replaces path only after a complete sibling temporary file
