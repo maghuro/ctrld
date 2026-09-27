@@ -128,6 +128,17 @@ func (s *merlinSvc) Install() error {
 	if err := tmpScript.Close(); err != nil {
 		return fmt.Errorf("tmpScript.Close: %w", err)
 	}
+	cleanupCreatedHook := func(line, script string) {
+		// Remove only ctrld's exact managed line first. If the file is still the
+		// pristine stub ctrld created, remove it; otherwise preserve any content
+		// another addon/user added concurrently.
+		_ = exec.Command("sh", tmpScript.Name(), line, script, "remove").Run()
+		buf, err := os.ReadFile(script)
+		if err == nil && bytes.Equal(buf, []byte("#!/bin/sh\n")) {
+			_ = os.Remove(script)
+		}
+	}
+
 	addLineToScript := func(line, script string) (created bool, retErr error) {
 		if _, err := os.Stat(script); os.IsNotExist(err) {
 			if err := os.WriteFile(script, []byte("#!/bin/sh\n"), 0755); err != nil {
@@ -139,13 +150,12 @@ func (s *merlinSvc) Install() error {
 		}
 		defer func() {
 			if retErr != nil && created {
-				_ = os.Remove(script)
+				cleanupCreatedHook(line, script)
 			}
 		}()
-		if err := os.Chmod(script, 0755); err != nil {
-			return created, fmt.Errorf("os.Chmod: jffs script: %w", err)
-		}
 
+		// A pre-existing shared hook owns its mode. Do not chmod it as a side
+		// effect of installing ctrld.
 		if err := exec.Command("sh", tmpScript.Name(), line, script, "add").Run(); err != nil {
 			return created, fmt.Errorf("exec.Command: add startup script: %w", err)
 		}
@@ -171,7 +181,7 @@ func (s *merlinSvc) Install() error {
 			for i := len(installed) - 1; i >= 0; i-- {
 				prev := installed[i]
 				if prev.created {
-					_ = os.Remove(prev.script)
+					cleanupCreatedHook(prev.line, prev.script)
 					continue
 				}
 				_ = exec.Command("sh", tmpScript.Name(), prev.line, prev.script, "remove").Run()
