@@ -408,7 +408,13 @@ func Test_atomicWriteFilePreservesExistingMode(t *testing.T) {
 	for _, mode := range []os.FileMode{0700, 0770} {
 		t.Run(mode.String(), func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "dnsmasq.postconf")
-			if err := os.WriteFile(path, []byte("old"), mode); err != nil {
+			if err := os.WriteFile(path, []byte("old"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			// os.WriteFile is subject to the process umask; set the fixture mode
+			// explicitly so the assertion tests atomicWriteFile rather than the
+			// runner's umask.
+			if err := os.Chmod(path, mode); err != nil {
 				t.Fatal(err)
 			}
 			if err := atomicWriteFile(path, []byte("new"), 0750); err != nil {
