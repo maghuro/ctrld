@@ -23,9 +23,11 @@ import (
 const Name = "merlin"
 
 const (
-	merlinManagedStatePath = "/jffs/controld/.merlin-dnsmasq-hooks-v2"
-	merlinSnapshotStatePath = "/jffs/controld/.merlin-dnsmasq-snapshot"
-	merlinCleanupPendingPath = "/jffs/controld/.merlin-dnsmasq-cleanup-pending"
+	merlinManagedStatePath       = "/jffs/controld/.merlin-dnsmasq-hooks-v2"
+	merlinSnapshotStatePath      = "/jffs/controld/.merlin-dnsmasq-snapshot"
+	merlinSnapshotAnchorPath     = "/jffs/configs/.dnsmasq.conf.ctrld-anchor"
+	merlinSnapshotQuarantinePath = "/jffs/configs/.dnsmasq.conf.ctrld-quarantine"
+	merlinCleanupPendingPath     = "/jffs/controld/.merlin-dnsmasq-cleanup-pending"
 )
 
 // nvramKvMap is a map of NVRAM key-value pairs used to configure and manage Merlin-specific settings.
