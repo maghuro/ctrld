@@ -80,3 +80,34 @@ func TestParseMerlinCustomClientList(t *testing.T) {
 		})
 	}
 }
+
+
+func TestParseMerlinCustomClientListReplacesPreviousSnapshot(t *testing.T) {
+	m := &merlinDiscover{}
+	m.parseMerlinCustomClientList(
+		"<old-client>00:00:00:00:00:01>0>4>><removed-client>00:00:00:00:00:02>0>24>>",
+	)
+	m.parseMerlinCustomClientList(
+		"<renamed-client>00:00:00:00:00:01>0>4>><new-client>00:00:00:00:00:03>0>24>>",
+	)
+
+	if got := m.LookupHostnameByMac("00:00:00:00:00:01"); got != "renamed-client" {
+		t.Fatalf("renamed client = %q, want %q", got, "renamed-client")
+	}
+	if got := m.LookupHostnameByMac("00:00:00:00:00:02"); got != "" {
+		t.Fatalf("removed client remained cached as %q", got)
+	}
+	if got := m.LookupHostnameByMac("00:00:00:00:00:03"); got != "new-client" {
+		t.Fatalf("new client = %q, want %q", got, "new-client")
+	}
+}
+
+func TestParseMerlinCustomClientListEmptySnapshotClearsCache(t *testing.T) {
+	m := &merlinDiscover{}
+	m.parseMerlinCustomClientList("<client1>00:00:00:00:00:01>0>4>>")
+	m.parseMerlinCustomClientList("")
+
+	if got := m.LookupHostnameByMac("00:00:00:00:00:01"); got != "" {
+		t.Fatalf("empty snapshot left stale hostname %q", got)
+	}
+}
