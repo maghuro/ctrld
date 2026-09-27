@@ -32,7 +32,6 @@ const (
 	MerlinJffsConfDir     = "/jffs/configs"
 	MerlinJffsConfPath    = "/jffs/configs/dnsmasq.conf"
 	MerlinPostConfPath    = "/jffs/scripts/dnsmasq.postconf"
-	MerlinSdnPostConfPath = "/jffs/scripts/dnsmasq-sdn.postconf"
 )
 
 const (
