@@ -40,6 +40,28 @@ func (d *dhcp) init() error {
 	}
 	d.addSelf()
 	d.watcher = watcher
+
+	// Install the directory watch before the initial file discovery. This closes
+	// the race where an SDN lease file is created after the startup snapshot but
+	// before watchChanges starts consuming fsnotify events.
+	leaseDir := router.LeaseFilesDir()
+	if leaseDir != "" {
+		if err := d.watcher.Add(leaseDir); err != nil {
+			ctrld.ProxyLogger.Load().Err(err).Str("dir", leaseDir).Msg("could not watch lease dir")
+		} else {
+			// First add all already-registered files while the directory watch is
+			// active, then scan for dynamic dnsmasq files which existed before the
+			// watcher was installed.
+			for file, format := range clientInfoFilesSnapshot() {
+				_ = d.addLeaseFile(file, format)
+			}
+			if err := d.discoverDynamicLeaseFiles(leaseDir); err != nil {
+				ctrld.ProxyLogger.Load().Err(err).Str("dir", leaseDir).Msg("could not scan lease dir")
+			}
+			return nil
+		}
+	}
+
 	for file, format := range clientInfoFilesSnapshot() {
 		// Ignore errors for default lease files.
 		_ = d.addLeaseFile(file, format)
@@ -50,11 +72,6 @@ func (d *dhcp) init() error {
 func (d *dhcp) watchChanges() {
 	if d.watcher == nil {
 		return
-	}
-	if dir := router.LeaseFilesDir(); dir != "" {
-		if err := d.watcher.Add(dir); err != nil {
-			ctrld.ProxyLogger.Load().Err(err).Str("dir", dir).Msg("could not watch lease dir")
-		}
 	}
 	for {
 		select {
@@ -184,6 +201,34 @@ func dynamicDnsmasqLeaseFileFormat(name string) (ctrld.LeaseFileFormat, bool) {
 		return "", false
 	}
 	return ctrld.Dnsmasq, true
+}
+
+
+func (d *dhcp) discoverDynamicLeaseFiles(dir string) error {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		path := filepath.Join(dir, entry.Name())
+		if _, registered := clientInfoFileFormat(path); registered {
+			// A registered file was already attempted above while the directory
+			// watcher was active. If it appeared during that attempt, its Create
+			// event is queued and watchChanges will retry it.
+			continue
+		}
+		format, ok := dynamicDnsmasqLeaseFileFormat(path)
+		if !ok {
+			continue
+		}
+		if err := d.addLeaseFile(path, format); err != nil && !os.IsNotExist(err) {
+			ctrld.ProxyLogger.Load().Err(err).Str("file", path).Msg("could not add discovered lease file")
+		}
+	}
+	return nil
 }
 
 // AddLeaseFile adds given lease file for reading/watching clients info.
