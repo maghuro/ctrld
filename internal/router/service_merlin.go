@@ -128,6 +128,16 @@ func syncMerlinServiceDir(dir string) error {
 	return f.Sync()
 }
 
+func validateMerlinSharedHook(path string, info os.FileInfo) error {
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("shared Merlin hook is not a regular file: %s", path)
+	}
+	if info.Mode().Perm()&0111 == 0 {
+		return fmt.Errorf("shared Merlin hook is not executable: %s", path)
+	}
+	return nil
+}
+
 func (s *merlinSvc) Install() error {
 	exePath, err := os.Executable()
 	if err != nil {
@@ -223,17 +233,25 @@ func (s *merlinSvc) Install() error {
 	}
 
 	addLineToScript := func(line, script string) (created, added bool, retErr error) {
-		if _, err := os.Stat(script); os.IsNotExist(err) {
+		if info, err := os.Stat(script); os.IsNotExist(err) {
 			if err := os.WriteFile(script, []byte("#!/bin/sh\n"), 0755); err != nil {
 				return false, false, err
 			}
 			created = true
 		} else if err != nil {
 			return false, false, err
+		} else if err := validateMerlinSharedHook(script, info); err != nil {
+			return false, false, err
 		}
 		defer func() {
 			if retErr != nil && created {
-				cleanupCreatedHook(line, script)
+				// On an editor failure ownership of any non-stub content is
+				// ambiguous. Remove only the untouched stub; otherwise leave the
+				// file for a safe resumable retry.
+				buf, err := os.ReadFile(script)
+				if err == nil && bytes.Equal(buf, []byte("#!/bin/sh\n")) {
+					_ = os.Remove(script)
+				}
 			}
 		}()
 
@@ -275,7 +293,9 @@ func (s *merlinSvc) Install() error {
 			for i := len(installed) - 1; i >= 0; i-- {
 				prev := installed[i]
 				if prev.created {
-					cleanupCreatedHook(prev.line, prev.script)
+					if prev.added {
+						cleanupCreatedHook(prev.line, prev.script)
+					}
 					continue
 				}
 				if prev.added {
