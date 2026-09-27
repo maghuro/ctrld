@@ -279,7 +279,21 @@ func (m *Merlin) Cleanup() error {
 	return nil
 }
 
-func buildLegacyCleanupJournal() (legacyCleanupJournal, error) {
+func legacySnapshotAnchorPath(path string) string {
+	return filepath.Join(
+		"/jffs/controld",
+		"."+filepath.Base(path)+".ctrld-legacy-anchor",
+	)
+}
+
+func removeLegacySnapshotAnchor(path string) error {
+	if err := removeFileDurable(legacySnapshotAnchorPath(path)); err != nil {
+		return fmt.Errorf("remove legacy snapshot anchor for %s: %w", path, err)
+	}
+	return nil
+}
+
+func buildLegacyCleanupJournal() (journal legacyCleanupJournal, retErr error) {
 	// A quarantine is meaningful only together with a durable journal. Never
 	// adopt an unjournaled private-looking pathname as ctrld-owned data.
 	orphans, err := filepath.Glob(filepath.Join(
@@ -296,6 +310,19 @@ func buildLegacyCleanupJournal() (legacyCleanupJournal, error) {
 		)
 	}
 
+	// With no durable journal present, any ctrld-private legacy anchors can only
+	// be leftovers from a crash before journal publication. Removing an anchor
+	// drops only ctrld's extra hard link; it never touches the public snapshot.
+	anchorOrphans, err := filepath.Glob("/jffs/controld/.dnsmasq*.ctrld-legacy-anchor")
+	if err != nil {
+		return legacyCleanupJournal{}, err
+	}
+	for _, anchor := range anchorOrphans {
+		if err := removeFileDurable(anchor); err != nil {
+			return legacyCleanupJournal{}, fmt.Errorf("remove orphaned legacy snapshot anchor %s: %w", anchor, err)
+		}
+	}
+
 	paths := []string{dnsmasq.MerlinJffsConfPath}
 	matches, err := filepath.Glob(filepath.Join(dnsmasq.MerlinJffsConfDir, "dnsmasq-*.conf"))
 	if err != nil {
@@ -303,22 +330,87 @@ func buildLegacyCleanupJournal() (legacyCleanupJournal, error) {
 	}
 	paths = append(paths, matches...)
 
-	journal := legacyCleanupJournal{phase: legacyCleanupPhase}
+	journal = legacyCleanupJournal{phase: legacyCleanupPhase}
+	captured := make([]string, 0, len(paths))
+	defer func() {
+		if retErr == nil {
+			return
+		}
+		for _, path := range captured {
+			_ = removeLegacySnapshotAnchor(path)
+		}
+	}()
+
 	for _, path := range paths {
 		if !isLegacySnapshotPath(path) {
 			continue
 		}
-		buf, err := os.ReadFile(path)
+
+		f, err := os.Open(path)
 		if os.IsNotExist(err) {
 			continue
 		}
 		if err != nil {
+			return legacyCleanupJournal{}, fmt.Errorf("open legacy dnsmasq snapshot %s: %w", path, err)
+		}
+		info, err := f.Stat()
+		if err != nil {
+			_ = f.Close()
+			return legacyCleanupJournal{}, fmt.Errorf("stat legacy dnsmasq snapshot %s: %w", path, err)
+		}
+		buf, err := io.ReadAll(f)
+		closeErr := f.Close()
+		if err != nil {
 			return legacyCleanupJournal{}, fmt.Errorf("read legacy dnsmasq snapshot %s: %w", path, err)
 		}
+		if closeErr != nil {
+			return legacyCleanupJournal{}, fmt.Errorf("close legacy dnsmasq snapshot %s: %w", path, closeErr)
+		}
+		hash := merlinSnapshotHash(buf)
+
+		anchor := legacySnapshotAnchorPath(path)
+		if err := os.Link(path, anchor); err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return legacyCleanupJournal{}, fmt.Errorf("capture legacy snapshot identity %s: %w", path, err)
+		}
+		captured = append(captured, path)
+		if err := syncParentDir(filepath.Dir(anchor)); err != nil {
+			return legacyCleanupJournal{}, fmt.Errorf("sync legacy snapshot anchor %s: %w", anchor, err)
+		}
+
+		anchorInfo, err := os.Stat(anchor)
+		if err != nil {
+			return legacyCleanupJournal{}, fmt.Errorf("stat legacy snapshot anchor %s: %w", anchor, err)
+		}
+		if !os.SameFile(info, anchorInfo) {
+			// The public pathname was replaced between Open and Link. Drop only
+			// our private link and never claim the replacement.
+			if err := removeLegacySnapshotAnchor(path); err != nil {
+				return legacyCleanupJournal{}, err
+			}
+			captured = captured[:len(captured)-1]
+			continue
+		}
+		anchorBuf, err := os.ReadFile(anchor)
+		if err != nil {
+			return legacyCleanupJournal{}, fmt.Errorf("read legacy snapshot anchor %s: %w", anchor, err)
+		}
+		if merlinSnapshotHash(anchorBuf) != hash {
+			// Same inode was modified while identity was being captured. Treat it
+			// as no longer safely attributable to ctrld.
+			if err := removeLegacySnapshotAnchor(path); err != nil {
+				return legacyCleanupJournal{}, err
+			}
+			captured = captured[:len(captured)-1]
+			continue
+		}
+
 		journal.entries = append(journal.entries, legacySnapshotEntry{
 			state: legacyEntryPending,
 			path:  path,
-			hash:  merlinSnapshotHash(buf),
+			hash:  hash,
 		})
 	}
 	return journal, nil
