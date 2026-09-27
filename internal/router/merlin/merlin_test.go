@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Control-D-Inc/ctrld"
 	"github.com/Control-D-Inc/ctrld/internal/router/dnsmasq"
 )
 
