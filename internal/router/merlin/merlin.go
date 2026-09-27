@@ -758,12 +758,8 @@ func writeMerlinHookUpdatesWith(
 func rollbackMerlinHookUpdates(updates []merlinHookUpdate) error {
 	for i := len(updates) - 1; i >= 0; i-- {
 		update := updates[i]
-		current, err := os.ReadFile(update.path)
-		if err != nil {
-			return fmt.Errorf("read %s during rollback: %w", update.path, err)
-		}
-		if !bytes.Equal(current, update.data) {
-			return fmt.Errorf("refusing to roll back %s after external modification", update.path)
+		if err := revalidateMerlinHookRollback(update); err != nil {
+			return fmt.Errorf("refusing to roll back %s: %w", update.path, err)
 		}
 		if update.existed {
 			if err := atomicWriteFile(update.path, update.original, 0750); err != nil {
@@ -771,9 +767,36 @@ func rollbackMerlinHookUpdates(updates []merlinHookUpdate) error {
 			}
 			continue
 		}
-		if err := os.Remove(update.path); err != nil && !os.IsNotExist(err) {
+		if err := removeFileDurable(update.path); err != nil {
 			return fmt.Errorf("remove newly created %s: %w", update.path, err)
 		}
+	}
+	return nil
+}
+
+func revalidateMerlinHookRollback(update merlinHookUpdate) error {
+	info, err := os.Lstat(update.path)
+	if err != nil {
+		return err
+	}
+	if update.existed && info.Mode().Type() != update.pathType {
+		return fmt.Errorf("shared hook type changed after ctrld write")
+	}
+	if update.existed && update.pathType&os.ModeSymlink != 0 {
+		target, err := os.Readlink(update.path)
+		if err != nil {
+			return err
+		}
+		if target != update.symlinkTarget {
+			return fmt.Errorf("shared hook symlink target changed after ctrld write")
+		}
+	}
+	current, err := os.ReadFile(update.path)
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(current, update.data) {
+		return fmt.Errorf("shared hook content changed after ctrld write")
 	}
 	return nil
 }
