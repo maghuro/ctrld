@@ -133,14 +133,23 @@ func syncMerlinServiceDir(dir string) error {
 	return f.Sync()
 }
 
-func validateMerlinSharedHook(path string, info os.FileInfo) error {
+func validateMerlinSharedHookPath(path string, requireExecutable bool) (exists bool, err error) {
+	info, err := os.Lstat(path)
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	// sed -i may replace a symlink rather than edit its target. Shared Merlin
+	// hooks must therefore be real regular files before ctrld edits them.
 	if !info.Mode().IsRegular() {
-		return fmt.Errorf("shared Merlin hook is not a regular file: %s", path)
+		return true, fmt.Errorf("shared Merlin hook is not a regular file: %s", path)
 	}
-	if info.Mode().Perm()&0111 == 0 {
-		return fmt.Errorf("shared Merlin hook is not executable: %s", path)
+	if requireExecutable && info.Mode().Perm()&0111 == 0 {
+		return true, fmt.Errorf("shared Merlin hook is not executable: %s", path)
 	}
-	return nil
+	return true, nil
 }
 
 func (s *merlinSvc) Install() error {
@@ -238,15 +247,15 @@ func (s *merlinSvc) Install() error {
 	}
 
 	addLineToScript := func(line, script string) (created, added bool, retErr error) {
-		if info, err := os.Stat(script); os.IsNotExist(err) {
+		exists, err := validateMerlinSharedHookPath(script, true)
+		if err != nil {
+			return false, false, err
+		}
+		if !exists {
 			if err := os.WriteFile(script, []byte("#!/bin/sh\n"), 0755); err != nil {
 				return false, false, err
 			}
 			created = true
-		} else if err != nil {
-			return false, false, err
-		} else if err := validateMerlinSharedHook(script, info); err != nil {
-			return false, false, err
 		}
 		defer func() {
 			if retErr != nil && created {
@@ -334,12 +343,14 @@ func (s *merlinSvc) Uninstall() error {
 		return fmt.Errorf("tmpScript.Close: %w", err)
 	}
 	removeLineFromScript := func(line, script string) error {
-		if _, err := os.Stat(script); os.IsNotExist(err) {
+		exists, err := validateMerlinSharedHookPath(script, false)
+		if err != nil {
+			return err
+		}
+		if !exists {
 			// Shared Merlin hooks belong to the router/user. Uninstalling ctrld
 			// must not create a hook file that did not exist.
 			return nil
-		} else if err != nil {
-			return err
 		}
 
 		if err := exec.Command("sh", tmpScript.Name(), line, script, "remove").Run(); err != nil {
