@@ -2,6 +2,8 @@ package merlin
 
 import (
 	"bytes"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -120,5 +122,78 @@ func Test_merlinParsePostConfPreservesLegacyPrefixAndSuffix(t *testing.T) {
 
 	if got := string(merlinParsePostConf([]byte(input))); got != want {
 		t.Fatalf("legacy cleanup changed unrelated content:\nwant: %q\ngot:  %q", want, got)
+	}
+}
+
+
+func Test_cleanupDnsmasqPostconfPreservesPreexistingStub(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "dnsmasq.postconf")
+	block := []byte("# BEGIN ctrld\necho managed\n# END ctrld")
+	installed := merlinUpsertPostConf([]byte("#!/bin/sh\n"), block)
+	if err := os.WriteFile(path, installed, 0750); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := cleanupDnsmasqPostconf(path); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("pre-existing hook stub was removed: %v", err)
+	}
+	if string(got) != "#!/bin/sh" {
+		t.Fatalf("unexpected restored stub: %q", got)
+	}
+}
+
+func Test_cleanupDnsmasqPostconfRemovesCtrldCreatedStub(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "dnsmasq.postconf")
+	block := []byte("# BEGIN ctrld\necho managed\n# END ctrld")
+	if err := os.WriteFile(path, merlinUpsertPostConf(nil, block), 0750); err != nil {
+		t.Fatal(err)
+	}
+	marker := merlinPostConfCreatedMarker(path)
+	if err := os.WriteFile(marker, []byte("created\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := cleanupDnsmasqPostconf(path); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("ctrld-created hook still exists: %v", err)
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("ctrld-created marker still exists: %v", err)
+	}
+}
+
+func Test_atomicWriteFilePreservesSymlink(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target")
+	link := filepath.Join(dir, "dnsmasq.postconf")
+	if err := os.WriteFile(target, []byte("old"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("target", link); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := atomicWriteFile(link, []byte("new"), 0750); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Lstat(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Fatal("atomicWriteFile replaced the symlink instead of its target")
+	}
+	got, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "new" {
+		t.Fatalf("target content = %q, want %q", got, "new")
 	}
 }
