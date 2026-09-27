@@ -660,15 +660,26 @@ func (s *merlinSvc) startLocked() error {
 		// recognized legacy bytes (or the migration actually published the
 		// current marked script before a durability error), start it rather than
 		// leaving DNS down. Anything else remains a hard error.
-		installed, exists, readErr := readExistingMerlinStartupScript(s.configPath())
+		canStart, readErr := canStartMerlinStartupAfterMigrationError(s.configPath(), migrationErr.legacy)
 		if readErr != nil {
 			return errors.Join(err, readErr)
 		}
-		if !exists || (!bytes.Equal(installed, migrationErr.legacy) && !merlinStartupScriptHasMarker(installed)) {
+		if !canStart {
 			return err
 		}
 	}
 	return exec.Command(s.configPath(), "start").Run()
+}
+
+func canStartMerlinStartupAfterMigrationError(path string, legacy []byte) (bool, error) {
+	installed, exists, err := readExistingMerlinStartupScript(path)
+	if err != nil {
+		return false, err
+	}
+	if !exists {
+		return false, nil
+	}
+	return bytes.Equal(installed, legacy) || merlinStartupScriptHasMarker(installed), nil
 }
 
 func (s *merlinSvc) Stop() error {
