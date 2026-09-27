@@ -686,3 +686,47 @@ func Test_encodeMainSnapshotStateAcceptsEveryTransactionPhase(t *testing.T) {
 		}
 	}
 }
+
+
+func Test_snapshotFileStillOwnedDetectsLateInodeModification(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "quarantine")
+	anchor := filepath.Join(dir, "anchor")
+	original := []byte("ctrld-owned\n")
+	if err := os.WriteFile(path, original, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(path, anchor); err != nil {
+		t.Fatal(err)
+	}
+	expected := merlinSnapshotHash(original)
+
+	owned, err := snapshotFileStillOwned(path, anchor, expected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !owned {
+		t.Fatal("unchanged hard-linked snapshot should be recognized as owned")
+	}
+
+	// Simulate a process which kept the inode open across quarantine and wrote
+	// new contents before final deletion.
+	if err := os.WriteFile(path, []byte("modified-through-same-inode\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	owned, err = snapshotFileStillOwned(path, anchor, expected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if owned {
+		t.Fatal("late modification of the same inode must invalidate ownership for deletion")
+	}
+}
+
+func Test_removeFileDurableAllowsRetryAfterFileAlreadyGone(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "already-gone")
+	if err := removeFileDurable(path); err != nil {
+		t.Fatalf("durability retry for absent file failed: %v", err)
+	}
+}
