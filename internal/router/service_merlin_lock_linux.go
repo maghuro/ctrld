@@ -32,7 +32,7 @@ func withMerlinServiceLock(fn func() error) error {
 		return fmt.Errorf("stat Merlin service lifecycle lock: %w", err)
 	}
 	if !info.Mode().IsRegular() {
-		return fmt.Errorf("Merlin service lifecycle lock is not a regular file: %s", merlinServiceLockPath)
+		return fmt.Errorf("merlin service lifecycle lock is not a regular file: %s", merlinServiceLockPath)
 	}
 	if err := f.Chmod(0600); err != nil {
 		return fmt.Errorf("chmod Merlin service lifecycle lock: %w", err)
