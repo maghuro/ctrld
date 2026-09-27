@@ -71,6 +71,11 @@ func merlinShellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'"
 }
 
+func merlinStartupHookLines(configPath string) (startLine, serviceEventLine string) {
+	path := merlinShellQuote(configPath)
+	return path + " start", path + ` service_event "$1" "$2"`
+}
+
 func writeMerlinStartupScript(path string, data []byte, mode os.FileMode) (published bool, retErr error) {
 	dir := filepath.Dir(path)
 	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".ctrld-*")
@@ -279,10 +284,10 @@ func (s *merlinSvc) Install() error {
 		created bool
 		added   bool
 	}
-	startupPath := merlinShellQuote(s.configPath())
+	startLine, serviceEventLine := merlinStartupHookLines(s.configPath())
 	hooks := []hookLine{
-		{script: merlinJFFSScriptPath, line: startupPath + " start"},
-		{script: merlinJFFSServiceEventScriptPath, line: startupPath + ` service_event "$1" "$2"`},
+		{script: merlinJFFSScriptPath, line: startLine},
+		{script: merlinJFFSServiceEventScriptPath, line: serviceEventLine},
 	}
 	installed := make([]hookLine, 0, len(hooks))
 	for _, hook := range hooks {
@@ -343,10 +348,10 @@ func (s *merlinSvc) Uninstall() error {
 		return nil
 	}
 
-	startupPath := merlinShellQuote(s.configPath())
+	startLine, serviceEventLine := merlinStartupHookLines(s.configPath())
 	for script, line := range map[string]string{
-		merlinJFFSScriptPath:             startupPath + " start",
-		merlinJFFSServiceEventScriptPath: startupPath + ` service_event "$1" "$2"`,
+		merlinJFFSScriptPath:             startLine,
+		merlinJFFSServiceEventScriptPath: serviceEventLine,
 	} {
 		if err := removeLineFromScript(line, script); err != nil {
 			return err
