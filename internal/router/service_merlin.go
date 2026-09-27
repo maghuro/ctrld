@@ -153,7 +153,7 @@ func (s *merlinSvc) Install() error {
 }
 
 func (s *merlinSvc) Uninstall() error {
-	if err := os.Remove(s.configPath()); err != nil {
+	if err := os.Remove(s.configPath()); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("os.Remove: %w", err)
 	}
 	tmpScript, err := os.CreateTemp("", "ctrld_uninstall")
@@ -171,16 +171,15 @@ func (s *merlinSvc) Uninstall() error {
 	}
 	removeLineFromScript := func(line, script string) error {
 		if _, err := os.Stat(script); os.IsNotExist(err) {
-			if err := os.WriteFile(script, []byte("#!/bin/sh\n"), 0755); err != nil {
-				return err
-			}
-		}
-		if err := os.Chmod(script, 0755); err != nil {
-			return fmt.Errorf("os.Chmod: jffs script: %w", err)
+			// Shared Merlin hooks belong to the router/user. Uninstalling ctrld
+			// must not create a hook file that did not exist.
+			return nil
+		} else if err != nil {
+			return err
 		}
 
 		if err := exec.Command("sh", tmpScript.Name(), line, script).Run(); err != nil {
-			return fmt.Errorf("exec.Command: add startup script: %w", err)
+			return fmt.Errorf("exec.Command: remove startup script: %w", err)
 		}
 		return nil
 	}
@@ -346,7 +345,8 @@ file=$2
 
 . /usr/sbin/helper.sh
 
-pc_append "$line" "$file" 
+pc_delete "$line" "$file"
+pc_append "$line" "$file"
 `
 
 const merlinRemoveLineFromScript = `#!/bin/sh
