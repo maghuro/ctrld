@@ -66,7 +66,7 @@ func prepareExistingMerlinStartupScript(path string, expected, legacy []byte) (e
 		return true, fmt.Errorf("already installed with different startup script: %s", path)
 	}
 	if needsMigration {
-		if err := replaceMerlinStartupScriptAtomically(path, expected, info); err != nil {
+		if err := replaceMerlinStartupScriptAtomically(path, expected, got, info); err != nil {
 			return true, err
 		}
 		return true, nil
@@ -77,7 +77,7 @@ func prepareExistingMerlinStartupScript(path string, expected, legacy []byte) (e
 	return true, nil
 }
 
-func replaceMerlinStartupScriptAtomically(path string, expected []byte, originalInfo os.FileInfo) error {
+func replaceMerlinStartupScriptAtomically(path string, expected, legacy []byte, originalInfo os.FileInfo) error {
 	dir := filepath.Dir(path)
 	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".ctrld-migrate-*")
 	if err != nil {
@@ -107,6 +107,13 @@ func replaceMerlinStartupScriptAtomically(path string, expected []byte, original
 	}
 	if !os.SameFile(originalInfo, pathInfo) {
 		return fmt.Errorf("startup script changed before migration publish: %s", path)
+	}
+	current, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(current, legacy) {
+		return fmt.Errorf("startup script contents changed before migration publish: %s", path)
 	}
 	return os.Rename(tmpPath, path)
 }
