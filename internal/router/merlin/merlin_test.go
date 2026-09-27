@@ -730,3 +730,22 @@ func Test_removeFileDurableAllowsRetryAfterFileAlreadyGone(t *testing.T) {
 		t.Fatalf("durability retry for absent file failed: %v", err)
 	}
 }
+
+
+func Test_merlinPostConfValidatesCtrldPidOwnership(t *testing.T) {
+	for _, want := range []string{
+		`case "$pid" in`,
+		`[ -r "/proc/${pid}/cmdline" ]`,
+		`tr '\\000' '\\n'`,
+		`ctrld|*/ctrld)`,
+		`ctrld_running=1`,
+		`if [ "$ctrld_running" -eq 1 ]; then`,
+	} {
+		if !strings.Contains(dnsmasq.MerlinPostConfTmpl, want) {
+			t.Fatalf("Merlin postconf is missing ctrld PID ownership check %q", want)
+		}
+	}
+	if strings.Contains(dnsmasq.MerlinPostConfTmpl, `[ -f "/proc/${pid}/cmdline" ]; then`) {
+		t.Fatal("Merlin postconf must not treat PID existence alone as ctrld ownership")
+	}
+}
