@@ -209,10 +209,15 @@ func SelfInterfaces() []*net.Interface {
 
 // LeaseFilesDir is the directory which contains lease files.
 func LeaseFilesDir() string {
-	if Name() == edgeos.Name {
-		edgeos.LeaseFileDir()
+	switch Name() {
+	case edgeos.Name:
+		return edgeos.LeaseFileDir()
+	case merlin.Name:
+		// Main and Guest Network Pro / SDN dnsmasq instances keep leases here.
+		return "/var/lib/misc"
+	default:
+		return ""
 	}
-	return ""
 }
 
 // ServiceDependencies returns list of dependencies that ctrld services needs on this router.
