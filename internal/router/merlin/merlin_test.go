@@ -141,7 +141,7 @@ func Test_cleanupDnsmasqPostconfPreservesPreexistingStub(t *testing.T) {
 	}
 }
 
-func Test_cleanupDnsmasqPostconfLeavesStubWhenCtrldCreatedHook(t *testing.T) {
+func Test_cleanupDnsmasqPostconfLeavesEmptyPathWhenCtrldCreatedHook(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "dnsmasq.postconf")
 	block := []byte("# BEGIN ctrld\necho managed\n# END ctrld")
 	if err := os.WriteFile(path, merlinUpsertPostConf(nil, block), 0750); err != nil {
@@ -155,8 +155,8 @@ func Test_cleanupDnsmasqPostconfLeavesStubWhenCtrldCreatedHook(t *testing.T) {
 	if err != nil {
 		t.Fatalf("cleanup removed shared hook path: %v", err)
 	}
-	if string(got) != "#!/bin/sh\n" {
-		t.Fatalf("unexpected cleaned stub: %q", got)
+	if len(got) != 0 {
+		t.Fatalf("unexpected cleaned ctrld-created hook: %q", got)
 	}
 }
 
@@ -213,6 +213,10 @@ func Test_merlinLegacyMarkersMustBeCompleteLines(t *testing.T) {
 
 func Test_merlinPostConfRoundTripRestoresOriginalBytes(t *testing.T) {
 	tests := [][]byte{
+		nil,
+		[]byte("\n\n"),
+		[]byte("echo no-shebang\n"),
+		[]byte("#!/bin/sh"),
 		[]byte("#!/bin/sh\n"),
 		[]byte("#!/bin/sh\n\necho custom\n"),
 		[]byte("#!/bin/sh\n# comment\necho one\necho two\n"),
@@ -242,23 +246,62 @@ func Test_merlinLegacyCleanupRestoresShebangAtByteZero(t *testing.T) {
 	}
 }
 
-func Test_merlinExistingHookShebangValidation(t *testing.T) {
-	tests := []struct {
-		name string
-		buf  []byte
-		want bool
-	}{
-		{"valid", []byte("#!/bin/sh\necho ok\n"), true},
-		{"empty", nil, false},
-		{"no shebang", []byte("echo no\n"), false},
-		{"unterminated shebang", []byte("#!/bin/sh"), false},
+func Test_merlinSyntheticShebangIsOwnedAndReversible(t *testing.T) {
+	orig := []byte("echo third-party-without-shebang\n")
+	block := []byte("# BEGIN ctrld\necho managed\n# END ctrld")
+	installed := merlinUpsertPostConf(orig, block)
+
+	if !bytes.HasPrefix(installed, []byte("#!/bin/sh\n")) {
+		t.Fatalf("synthetic shebang missing: %q", installed)
 	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := merlinExistingHookHasValidShebang(tc.buf); got != tc.want {
-				t.Fatalf("validation = %v, want %v for %q", got, tc.want, tc.buf)
-			}
-		})
+	if !bytes.Contains(installed, []byte(dnsmasq.MerlinSyntheticShebangMarker)) {
+		t.Fatalf("synthetic shebang ownership marker missing: %q", installed)
+	}
+	if got := merlinParsePostConf(installed); !bytes.Equal(got, orig) {
+		t.Fatalf("cleanup did not restore original bytes:\nwant: %q\ngot:  %q", orig, got)
+	}
+}
+
+func Test_merlinLegacyEmptyHookCanBeReinstalled(t *testing.T) {
+	legacy := []byte(legacyMerlinPostConf(""))
+	clean := merlinParsePostConf(legacy)
+	if len(clean) != 0 {
+		t.Fatalf("legacy cleanup = %q, want empty hook", clean)
+	}
+
+	block := []byte("# BEGIN ctrld\necho managed\n# END ctrld")
+	reinstalled := merlinUpsertPostConf(clean, block)
+	if !bytes.HasPrefix(reinstalled, []byte("#!/bin/sh\n")) ||
+		!bytes.Contains(reinstalled, []byte(dnsmasq.MerlinSyntheticShebangMarker)) {
+		t.Fatalf("empty legacy hook was not safely reinstalled: %q", reinstalled)
+	}
+	if got := merlinParsePostConf(reinstalled); len(got) != 0 {
+		t.Fatalf("reinstalled hook did not round-trip to empty: %q", got)
+	}
+}
+
+func Test_writeMerlinHookUpdatesPreflightsAllPaths(t *testing.T) {
+	dir := t.TempDir()
+	first := filepath.Join(dir, "dnsmasq.postconf")
+	second := filepath.Join(dir, "dnsmasq-sdn.postconf")
+	orig := []byte("#!/bin/sh\necho untouched\n")
+	if err := os.WriteFile(first, orig, 0750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(second, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	block := []byte("# BEGIN ctrld\necho managed\n# END ctrld")
+	if err := writeMerlinHookUpdates([]string{first, second}, block); err == nil {
+		t.Fatal("expected second-path preflight error")
+	}
+	got, err := os.ReadFile(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, orig) {
+		t.Fatalf("first hook changed before second path passed preflight:\nwant: %q\ngot:  %q", orig, got)
 	}
 }
 
