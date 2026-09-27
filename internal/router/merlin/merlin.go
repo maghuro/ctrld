@@ -845,9 +845,13 @@ func cleanupQuarantinedMainSnapshot(state mainSnapshotState) error {
 			}
 			return fmt.Errorf("quarantine Merlin fallback: %w", err)
 		}
-		if err := syncParentDir(dnsmasq.MerlinJffsConfDir); err != nil {
-			return fmt.Errorf("sync Merlin fallback quarantine: %w", err)
-		}
+	}
+	// Always sync before advancing the journal. On a retry, quarantine may
+	// already exist because rename succeeded previously while its directory
+	// fsync failed; observing the pathname is not proof that the rename is
+	// durable across power loss.
+	if err := syncParentDir(dnsmasq.MerlinJffsConfDir); err != nil {
+		return fmt.Errorf("sync Merlin fallback quarantine: %w", err)
 	}
 
 	anchorExists, err := pathExists(merlinSnapshotAnchorPath)
@@ -976,9 +980,12 @@ func restoreQuarantinedMainSnapshot(state mainSnapshotState) error {
 		if err := os.Link(merlinSnapshotQuarantinePath, dnsmasq.MerlinJffsConfPath); err != nil {
 			return fmt.Errorf("restore quarantined Merlin fallback: %w", err)
 		}
-		if err := syncParentDir(dnsmasq.MerlinJffsConfDir); err != nil {
-			return fmt.Errorf("sync restored Merlin fallback: %w", err)
-		}
+	}
+	// Re-sync even when the public hard link already exists. It may be the
+	// result of a previous attempt where link(2) succeeded but directory fsync
+	// failed, so the pathname alone is not enough to publish restored-v2.
+	if err := syncParentDir(dnsmasq.MerlinJffsConfDir); err != nil {
+		return fmt.Errorf("sync restored Merlin fallback: %w", err)
 	}
 
 	state.phase = snapshotPhaseRestored
