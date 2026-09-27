@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -39,7 +40,7 @@ func (d *dhcp) init() error {
 	}
 	d.addSelf()
 	d.watcher = watcher
-	for file, format := range clientInfoFiles {
+	for file, format := range clientInfoFilesSnapshot() {
 		// Ignore errors for default lease files.
 		_ = d.addLeaseFile(file, format)
 	}
@@ -62,7 +63,11 @@ func (d *dhcp) watchChanges() {
 				return
 			}
 			if event.Has(fsnotify.Create) {
-				if format, ok := clientInfoFiles[event.Name]; ok {
+				format, ok := clientInfoFileFormat(event.Name)
+				if !ok {
+					format, ok = dynamicDnsmasqLeaseFileFormat(event.Name)
+				}
+				if ok {
 					if err := d.addLeaseFile(event.Name, format); err != nil {
 						ctrld.ProxyLogger.Load().Err(err).Str("file", event.Name).Msg("could not add lease file")
 					}
@@ -70,7 +75,10 @@ func (d *dhcp) watchChanges() {
 				continue
 			}
 			if event.Has(fsnotify.Write) || event.Has(fsnotify.Rename) || event.Has(fsnotify.Chmod) || event.Has(fsnotify.Remove) {
-				format := clientInfoFiles[event.Name]
+				format, ok := clientInfoFileFormat(event.Name)
+				if !ok {
+					continue
+				}
 				if err := d.readLeaseFile(event.Name, format); err != nil && !os.IsNotExist(err) {
 					ctrld.ProxyLogger.Load().Err(err).Str("file", event.Name).Msg("leases file changed but failed to update client info")
 				}
@@ -170,6 +178,14 @@ func (d *dhcp) lookupIPByHostname(name string, v6 bool) string {
 	return ""
 }
 
+func dynamicDnsmasqLeaseFileFormat(name string) (ctrld.LeaseFileFormat, bool) {
+	matched, err := filepath.Match("dnsmasq-*.leases", filepath.Base(name))
+	if err != nil || !matched {
+		return "", false
+	}
+	return ctrld.Dnsmasq, true
+}
+
 // AddLeaseFile adds given lease file for reading/watching clients info.
 func (d *dhcp) addLeaseFile(name string, format ctrld.LeaseFileFormat) error {
 	if d.watcher == nil {
@@ -178,7 +194,7 @@ func (d *dhcp) addLeaseFile(name string, format ctrld.LeaseFileFormat) error {
 	if err := d.readLeaseFile(name, format); err != nil {
 		return fmt.Errorf("could not read lease file: %w", err)
 	}
-	clientInfoFiles[name] = format
+	setClientInfoFile(name, format)
 	return d.watcher.Add(name)
 }
 
