@@ -611,8 +611,12 @@ func Test_writeFileNoReplaceRefusesExistingTarget(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := writeFileNoReplace(path, []byte("ctrld-owned\n"), 0644); err == nil {
+	published, err := writeFileNoReplace(path, []byte("ctrld-owned\n"), 0644)
+	if err == nil {
 		t.Fatal("expected no-replace publication to fail when target already exists")
+	}
+	if published {
+		t.Fatal("existing-target conflict must report published=false")
 	}
 	got, err := os.ReadFile(path)
 	if err != nil {
@@ -628,8 +632,12 @@ func Test_writeFileNoReplacePublishesAbsentTarget(t *testing.T) {
 	path := filepath.Join(dir, "dnsmasq.conf")
 	want := []byte("ctrld-owned\n")
 
-	if err := writeFileNoReplace(path, want, 0644); err != nil {
+	published, err := writeFileNoReplace(path, want, 0644)
+	if err != nil {
 		t.Fatal(err)
+	}
+	if !published {
+		t.Fatal("successful no-replace publication must report published=true")
 	}
 	got, err := os.ReadFile(path)
 	if err != nil {
@@ -637,5 +645,51 @@ func Test_writeFileNoReplacePublishesAbsentTarget(t *testing.T) {
 	}
 	if !bytes.Equal(got, want) {
 		t.Fatalf("published target mismatch:\nwant: %q\ngot:  %q", want, got)
+	}
+}
+
+
+func Test_quarantineRemoveOwnedFileDeletesCapturedOwnedSnapshot(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "dnsmasq.conf")
+	content := []byte("ctrld-owned\n")
+	if err := os.WriteFile(path, content, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	removed, err := quarantineRemoveOwnedFile(path, merlinSnapshotHash(content))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !removed {
+		t.Fatal("expected an existing owned snapshot to be captured")
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("owned snapshot still exists after cleanup: %v", err)
+	}
+}
+
+func Test_quarantineRemoveOwnedFileRestoresModifiedSnapshot(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "dnsmasq.conf")
+	owned := []byte("ctrld-owned\n")
+	modified := []byte("user-modified\n")
+	if err := os.WriteFile(path, modified, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	removed, err := quarantineRemoveOwnedFile(path, merlinSnapshotHash(owned))
+	if err == nil {
+		t.Fatal("expected modified snapshot cleanup refusal")
+	}
+	if !removed {
+		t.Fatal("expected modified snapshot to be captured and restored")
+	}
+	got, readErr := os.ReadFile(path)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if !bytes.Equal(got, modified) {
+		t.Fatalf("modified snapshot was not restored byte-for-byte:\nwant: %q\ngot:  %q", modified, got)
 	}
 }
