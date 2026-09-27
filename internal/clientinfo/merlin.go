@@ -3,6 +3,7 @@ package clientinfo
 import (
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/Control-D-Inc/ctrld/internal/router"
 	"github.com/Control-D-Inc/ctrld/internal/router/merlin"
@@ -14,13 +15,22 @@ import (
 const merlinNvramCustomClientListKey = "custom_clientlist"
 
 type merlinDiscover struct {
-	hostname sync.Map // mac => hostname
+	// Serialize the read+publish refresh transaction. Lookups remain lock-free.
+	refreshMu sync.Mutex
+
+	// Each published map is immutable. Refresh builds a complete replacement
+	// off to the side and swaps the pointer once, so concurrent lookups never
+	// observe an empty/partial/interleaved custom_clientlist snapshot.
+	hostname atomic.Pointer[map[string]string]
 }
 
 func (m *merlinDiscover) refresh() error {
 	if router.Name() != merlin.Name {
 		return nil
 	}
+	m.refreshMu.Lock()
+	defer m.refreshMu.Unlock()
+
 	out, err := nvram.Run("get", merlinNvramCustomClientListKey)
 	if err != nil {
 		return err
@@ -35,11 +45,11 @@ func (m *merlinDiscover) LookupHostnameByIP(ip string) string {
 }
 
 func (m *merlinDiscover) LookupHostnameByMac(mac string) string {
-	val, ok := m.hostname.Load(mac)
-	if !ok {
+	snapshot := m.hostname.Load()
+	if snapshot == nil {
 		return ""
 	}
-	return val.(string)
+	return (*snapshot)[mac]
 }
 
 // "nvram get custom_clientlist" output:
@@ -54,6 +64,9 @@ func (m *merlinDiscover) LookupHostnameByMac(mac string) string {
 //   - Empty parts[0]               => skip empty hostname
 //   - Empty parts[1]               => skip empty MAC
 func (m *merlinDiscover) parseMerlinCustomClientList(data string) {
+	// custom_clientlist is a complete snapshot, not a delta. Build the next
+	// immutable snapshot privately and publish it with one atomic pointer swap.
+	next := make(map[string]string)
 	entries := strings.Split(data, "<")
 	for _, entry := range entries {
 		parts := strings.SplitN(string(entry), ">", 3)
@@ -62,8 +75,9 @@ func (m *merlinDiscover) parseMerlinCustomClientList(data string) {
 		}
 		hostname := normalizeHostname(parts[0])
 		mac := strings.ToLower(parts[1])
-		m.hostname.Store(mac, hostname)
+		next[mac] = hostname
 	}
+	m.hostname.Store(&next)
 }
 
 func (m *merlinDiscover) String() string {
