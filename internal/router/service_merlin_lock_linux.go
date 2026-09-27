@@ -12,16 +12,36 @@ import (
 const merlinServiceLockPath = "/tmp/ctrld-merlin-service.lock"
 
 func withMerlinServiceLock(fn func() error) error {
-	f, err := os.OpenFile(merlinServiceLockPath, os.O_CREATE|os.O_RDWR, 0600)
+	fd, err := unix.Open(
+		merlinServiceLockPath,
+		unix.O_CREAT|unix.O_RDWR|unix.O_CLOEXEC|unix.O_NOFOLLOW,
+		0600,
+	)
 	if err != nil {
-		return err
+		return fmt.Errorf("open Merlin service lifecycle lock: %w", err)
+	}
+	f := os.NewFile(uintptr(fd), merlinServiceLockPath)
+	if f == nil {
+		_ = unix.Close(fd)
+		return fmt.Errorf("wrap Merlin service lifecycle lock descriptor")
 	}
 	defer f.Close()
 
-	if err := unix.Flock(int(f.Fd()), unix.LOCK_EX); err != nil {
+	info, err := f.Stat()
+	if err != nil {
+		return fmt.Errorf("stat Merlin service lifecycle lock: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("Merlin service lifecycle lock is not a regular file: %s", merlinServiceLockPath)
+	}
+	if err := f.Chmod(0600); err != nil {
+		return fmt.Errorf("chmod Merlin service lifecycle lock: %w", err)
+	}
+
+	if err := unix.Flock(fd, unix.LOCK_EX); err != nil {
 		return fmt.Errorf("lock Merlin service lifecycle: %w", err)
 	}
-	defer unix.Flock(int(f.Fd()), unix.LOCK_UN)
+	defer unix.Flock(fd, unix.LOCK_UN)
 
 	return fn()
 }
