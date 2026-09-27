@@ -559,8 +559,11 @@ if [ "$mode" = "remove" ]; then
 else
   if grep -qxF "$line" "$file"; then
     exit 0
+  else
+    grep_status=$?
+    [ "$grep_status" -eq 1 ] || exit "$grep_status"
   fi
-  pc_append "$line" "$file"
+  pc_append "$line" "$file" || exit $?
   printf 'added\n'
 fi
 `
