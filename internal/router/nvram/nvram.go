@@ -136,6 +136,19 @@ func SetKV(m map[string]string, setupKey string) error {
 // that could destroy the only rollback copy after a transient nvram failure.
 // A future SetKV overwrites each backup with the then-current value.
 func Restore(m map[string]string, setupKey string) error {
+	return restore(m, setupKey, false)
+}
+
+// RestoreWithVolatileRetryMarker is Merlin's retry-aware Restore variant.
+// If the persistent restore commit fails after setupKey was unset in the
+// volatile NVRAM view, setupKey is re-armed only in RAM so Merlin PreRun can
+// retry Cleanup in the same boot. Other router backends intentionally use
+// Restore and keep their existing one-shot semantics.
+func RestoreWithVolatileRetryMarker(m map[string]string, setupKey string) error {
+	return restore(m, setupKey, true)
+}
+
+func restore(m map[string]string, setupKey string, rearmVolatile bool) error {
 	for key := range m {
 		ctrldKey := CtrldKeyPrefix + key
 		old, err := Run("get", ctrldKey)
@@ -151,13 +164,16 @@ func Restore(m map[string]string, setupKey string) error {
 		return fmt.Errorf("%s: %w", out, err)
 	}
 	if out, err := Run("commit"); err != nil {
-		// The persistent commit may have failed while the volatile nvram view
-		// already has setupKey unset. Re-arm setupKey only in volatile NVRAM so
-		// Merlin Cleanup will retry Restore in this boot, but deliberately do not
-		// commit the marker: if the restored values actually reached persistent
-		// storage despite the reported error, a reboot must not resurrect a
-		// completed ctrld setup transaction.
 		commitErr := fmt.Errorf("%s: %w", out, err)
+		if !rearmVolatile {
+			return commitErr
+		}
+
+		// Merlin retries Cleanup during PreRun. The persistent commit may have
+		// failed while the volatile NVRAM view already has setupKey unset.
+		// Re-arm setupKey only in RAM so that same-boot retry remains possible,
+		// but do not commit it: if the restored values actually reached flash
+		// despite the reported error, reboot must not resurrect a completed setup.
 		if markerOut, markerErr := Run("set", setupKey+"=1"); markerErr != nil {
 			return errors.Join(
 				commitErr,
