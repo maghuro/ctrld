@@ -482,8 +482,17 @@ case "$1" in
     svc=$3
     dnsmasq_pid_file=$(sed -n '/pid-file=/s///p' /etc/dnsmasq.conf)
 
-    if [ "$event" = "restart" ] && [ "$svc" = "diskmon" ]; then
-      kill "$(cat "$dnsmasq_pid_file")" >/dev/null 2>&1
+    if [ "$event" = "restart" ] && [ "$svc" = "diskmon" ] && [ -r "$dnsmasq_pid_file" ]; then
+      dnsmasq_pid="$(cat "$dnsmasq_pid_file" 2>/dev/null)"
+      case "$dnsmasq_pid" in
+        ''|*[!0-9]*) dnsmasq_pid="" ;;
+      esac
+      if [ -n "$dnsmasq_pid" ] && [ -r "/proc/$dnsmasq_pid/cmdline" ]; then
+        dnsmasq_exe="$(tr '\000' '\n' < "/proc/$dnsmasq_pid/cmdline" 2>/dev/null | sed -n '1p')"
+        case "$dnsmasq_exe" in
+          dnsmasq|*/dnsmasq) kill "$dnsmasq_pid" >/dev/null 2>&1 ;;
+        esac
+      fi
     fi
   ;;
   *)
