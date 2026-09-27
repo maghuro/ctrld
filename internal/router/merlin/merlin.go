@@ -35,7 +35,6 @@ var nvramKvMap = map[string]string{
 	"dnspriv_enable": "0", // Ensure Merlin native DoT disabled.
 }
 
-// dnsmasqConfig represents configuration paths for dnsmasq operations in Merlin firmware.
 
 // Merlin represents a configuration handler for setting up and managing ctrld on Merlin routers.
 type Merlin struct {
