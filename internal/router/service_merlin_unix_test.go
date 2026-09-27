@@ -3,6 +3,7 @@
 package router
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -37,6 +38,27 @@ func TestCreateMerlinSharedHookStubIgnoresRestrictiveUmask(t *testing.T) {
 	}
 }
 
+
+func TestCreateMerlinSharedHookStubDoesNotClobberExistingTarget(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "services-start")
+	want := []byte("#!/bin/sh\necho addon\n")
+	if err := os.WriteFile(path, want, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := createMerlinSharedHookStub(path); !os.IsExist(err) {
+		t.Fatalf("createMerlinSharedHookStub error = %v, want already-exists", err)
+	}
+
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("existing shared hook was modified:\nwant %q\ngot  %q", want, got)
+	}
+}
 
 func TestReplaceMerlinStartupScriptAtomicallyPreservesReplacedTarget(t *testing.T) {
 	dir := t.TempDir()
