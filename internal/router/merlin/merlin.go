@@ -105,8 +105,24 @@ func (m *Merlin) PreRun() error {
 }
 
 func ensureMerlinStateDir() error {
+	if info, err := os.Stat(merlinStateDir); err == nil {
+		if !info.IsDir() {
+			return fmt.Errorf("Merlin state path is not a directory: %s", merlinStateDir)
+		}
+		return nil
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("stat Merlin state directory %s: %w", merlinStateDir, err)
+	}
+
+	// A newly created JFFS directory entry is not crash-durable until its
+	// parent has been synced. State files below this directory are used to
+	// distinguish current hook-based installs from legacy snapshot ownership,
+	// so losing only the directory across power loss would be unsafe.
 	if err := os.MkdirAll(merlinStateDir, 0755); err != nil {
 		return fmt.Errorf("create Merlin state directory %s: %w", merlinStateDir, err)
+	}
+	if err := syncParentDir(filepath.Dir(merlinStateDir)); err != nil {
+		return fmt.Errorf("sync parent of Merlin state directory %s: %w", merlinStateDir, err)
 	}
 	return nil
 }
