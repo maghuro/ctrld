@@ -779,6 +779,27 @@ func rollbackMerlinHookUpdates(updates []merlinHookUpdate) error {
 }
 
 func prepareMerlinHookUpdate(path string, block []byte) (merlinHookUpdate, error) {
+	return prepareMerlinHookReplacement(path, func(buf []byte) []byte {
+		return merlinUpsertPostConf(buf, block)
+	})
+}
+
+func prepareMerlinHookCleanup(path string) (*merlinHookUpdate, error) {
+	_, err := os.Lstat(path)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	update, err := prepareMerlinHookReplacement(path, merlinParsePostConf)
+	if err != nil {
+		return nil, err
+	}
+	return &update, nil
+}
+
+func prepareMerlinHookReplacement(path string, transform func([]byte) []byte) (merlinHookUpdate, error) {
 	info, statErr := os.Lstat(path)
 	pathMissing := os.IsNotExist(statErr)
 	if statErr != nil && !pathMissing {
@@ -795,7 +816,7 @@ func prepareMerlinHookUpdate(path string, block []byte) (merlinHookUpdate, error
 
 	update := merlinHookUpdate{
 		path:     path,
-		data:     merlinUpsertPostConf(buf, block),
+		data:     transform(buf),
 		original: append([]byte(nil), buf...),
 		existed:  !pathMissing,
 	}
@@ -852,19 +873,19 @@ func revalidateMerlinHookUpdate(update merlinHookUpdate) error {
 }
 
 func cleanupDnsmasqPostconf(path string) error {
-	buf, err := os.ReadFile(path)
-	if os.IsNotExist(err) {
-		return nil
-	}
-	if err != nil {
+	update, err := prepareMerlinHookCleanup(path)
+	if err != nil || update == nil {
 		return err
 	}
-
-	clean := merlinParsePostConf(buf)
-	// Never delete a shared Merlin hook outright. We cannot safely prove
-	// persistent ownership across addon rewrites/reboots, so cleanup removes
-	// only ctrld-owned bytes and leaves any resulting stub in place.
-	return atomicWriteFile(path, clean, 0750)
+	if bytes.Equal(update.original, update.data) {
+		return nil
+	}
+	if err := revalidateMerlinHookUpdate(*update); err != nil {
+		return fmt.Errorf("revalidate Merlin hook cleanup %s: %w", path, err)
+	}
+	// Never delete a shared Merlin hook outright. Cleanup removes only ctrld's
+	// owned bytes and preserves the path, content and mode belonging to others.
+	return atomicWriteFile(path, update.data, 0750)
 }
 
 // restartDNSMasq restarts the dnsmasq service by executing the appropriate system command using "service".
