@@ -680,9 +680,21 @@ func (s *merlinSvc) stopLocked() error {
 }
 
 func (s *merlinSvc) Restart() error {
+	return s.RestartWith(nil)
+}
+
+// RestartWith serializes the complete Merlin stop/between/start transaction.
+// The callback lets the CLI keep router cleanup, DNS restoration and process
+// wait semantics inside the same cross-process lifecycle lock.
+func (s *merlinSvc) RestartWith(between func() error) error {
 	return withMerlinServiceLock(func() error {
 		if err := s.stopLocked(); err != nil {
 			return err
+		}
+		if between != nil {
+			if err := between(); err != nil {
+				return err
+			}
 		}
 		return s.startLocked()
 	})
