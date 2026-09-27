@@ -33,8 +33,14 @@ func TestMerlinServiceRestartStopsBeforeStarting(t *testing.T) {
 }
 
 func TestMerlinServiceHookEditorIsIdempotent(t *testing.T) {
-	if !strings.Contains(merlinAddLineToScript, `grep -qxF "$line" "$file" || pc_append "$line" "$file"`) {
-		t.Fatal("hook editor must append ctrld's exact line only when it is absent")
+	for _, want := range []string{
+		`if grep -qxF "$line" "$file"; then`,
+		`pc_append "$line" "$file"`,
+		`printf 'added\\n'`,
+	} {
+		if !strings.Contains(merlinAddLineToScript, want) {
+			t.Fatalf("hook editor missing idempotent append signal %q", want)
+		}
 	}
 	for _, script := range []string{merlinAddLineToScript, merlinRemoveLineFromScript} {
 		if !strings.Contains(script, `sed -i "/^$pattern$/d" "$file"`) {
