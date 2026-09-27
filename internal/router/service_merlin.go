@@ -83,6 +83,8 @@ func (s *merlinSvc) Install() error {
 	confPath := s.configPath()
 	if _, err := os.Stat(confPath); err == nil {
 		return fmt.Errorf("already installed: %s", confPath)
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("os.Stat: startup script: %w", err)
 	}
 
 	var to = &struct {
@@ -93,18 +95,14 @@ func (s *merlinSvc) Install() error {
 		exePath,
 	}
 
-	f, err := os.Create(confPath)
-	if err != nil {
-		return fmt.Errorf("os.Create: %w", err)
-	}
-	defer f.Close()
-
-	if err := s.template().Execute(f, to); err != nil {
+	// Render completely before touching the destination. A template error must
+	// not leave a truncated startup script which then looks "already installed".
+	var rendered bytes.Buffer
+	if err := s.template().Execute(&rendered, to); err != nil {
 		return fmt.Errorf("s.template.Execute: %w", err)
 	}
-
-	if err = os.Chmod(confPath, 0755); err != nil {
-		return fmt.Errorf("os.Chmod: startup script: %w", err)
+	if err := os.WriteFile(confPath, rendered.Bytes(), 0755); err != nil {
+		return fmt.Errorf("os.WriteFile: startup script: %w", err)
 	}
 
 	if err := os.MkdirAll(filepath.Dir(merlinJFFSScriptPath), 0755); err != nil {
@@ -129,6 +127,8 @@ func (s *merlinSvc) Install() error {
 			if err := os.WriteFile(script, []byte("#!/bin/sh\n"), 0755); err != nil {
 				return err
 			}
+		} else if err != nil {
+			return err
 		}
 		if err := os.Chmod(script, 0755); err != nil {
 			return fmt.Errorf("os.Chmod: jffs script: %w", err)
