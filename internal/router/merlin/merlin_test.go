@@ -736,7 +736,7 @@ func Test_merlinPostConfValidatesCtrldPidOwnership(t *testing.T) {
 	for _, want := range []string{
 		`case "$pid" in`,
 		`[ -r "/proc/${pid}/cmdline" ]`,
-		`tr '\\000' '\\n'`,
+		`tr '\000' '\n'`,
 		`ctrld|*/ctrld)`,
 		`ctrld_running=1`,
 		`if [ "$ctrld_running" -eq 1 ]; then`,
