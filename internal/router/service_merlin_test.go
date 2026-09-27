@@ -225,3 +225,15 @@ func TestValidateMerlinSharedHookRequiresExecutable(t *testing.T) {
 		t.Fatalf("executable shared hook rejected: %v", err)
 	}
 }
+
+
+func TestMerlinStartupHookLinesQuoteConfigPath(t *testing.T) {
+	start, event := merlinStartupHookLines("/jffs/my dir/it's ctrld.startup")
+	wantPrefix := `'/jffs/my dir/it'"'"'s ctrld.startup'`
+	if start != wantPrefix+" start" {
+		t.Fatalf("start hook = %q", start)
+	}
+	if event != wantPrefix+` service_event "$1" "$2"` {
+		t.Fatalf("service-event hook = %q", event)
+	}
+}
