@@ -87,8 +87,11 @@ func Test_merlinPostConfDoesNotExitHostHook(t *testing.T) {
 	if strings.Contains(dnsmasq.MerlinPostConfTmpl, "exit 0") {
 		t.Fatal("ctrld postconf block must not terminate the enclosing Merlin hook")
 	}
+	trimmed := strings.TrimSpace(dnsmasq.MerlinPostConfTmpl)
+	if !strings.HasPrefix(trimmed, "(") || !strings.HasSuffix(trimmed, ")") {
+		t.Fatal("ctrld postconf block must run in a subshell to isolate shared-hook variables")
+	}
 }
-
 
 func Test_merlinLegacyMigrationPreservesPrependedContent(t *testing.T) {
 	legacy := "echo addon-before\n" + legacyMerlinPostConf("echo addon-after")
