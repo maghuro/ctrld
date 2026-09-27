@@ -490,6 +490,30 @@ func Test_dnsmasqConfigUsesCtrld(t *testing.T) {
 			want: false,
 		},
 		{
+			name: "conf file include is unresolved",
+			ip:   "0.0.0.0",
+			port: 5354,
+			content: good("server=127.0.0.1#5354") +
+				"conf-file=/jffs/configs/extra-dnsmasq.conf\n",
+			want: false,
+		},
+		{
+			name: "conf dir include is unresolved",
+			ip:   "0.0.0.0",
+			port: 5354,
+			content: good("server=127.0.0.1#5354") +
+				"conf-dir=/jffs/configs/dnsmasq.d\n",
+			want: false,
+		},
+		{
+			name: "conf script include is unresolved",
+			ip:   "0.0.0.0",
+			port: 5354,
+			content: good("server=127.0.0.1#5354") +
+				"conf-script=/jffs/scripts/dnsmasq-extra.sh\n",
+			want: false,
+		},
+		{
 			name:    "missing metadata directives",
 			ip:      "0.0.0.0",
 			port:    5354,
