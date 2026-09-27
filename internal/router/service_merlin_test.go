@@ -200,29 +200,37 @@ func TestMerlinServiceEventValidatesDnsmasqPidOwnership(t *testing.T) {
 }
 
 
-func TestValidateMerlinSharedHookRequiresExecutable(t *testing.T) {
+func TestValidateMerlinSharedHookPath(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "services-start")
+
+	exists, err := validateMerlinSharedHookPath(path, true)
+	if err != nil || exists {
+		t.Fatalf("missing hook = (%v, %v), want (false, nil)", exists, err)
+	}
+
 	if err := os.WriteFile(path, []byte("#!/bin/sh\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	info, err := os.Stat(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := validateMerlinSharedHook(path, info); err == nil {
+	if _, err := validateMerlinSharedHookPath(path, true); err == nil {
 		t.Fatal("expected non-executable shared hook to be rejected")
+	}
+	if exists, err := validateMerlinSharedHookPath(path, false); err != nil || !exists {
+		t.Fatalf("regular non-executable hook should be editable for uninstall: (%v, %v)", exists, err)
 	}
 
 	if err := os.Chmod(path, 0755); err != nil {
 		t.Fatal(err)
 	}
-	info, err = os.Stat(path)
-	if err != nil {
-		t.Fatal(err)
+	if exists, err := validateMerlinSharedHookPath(path, true); err != nil || !exists {
+		t.Fatalf("executable shared hook rejected: (%v, %v)", exists, err)
 	}
-	if err := validateMerlinSharedHook(path, info); err != nil {
-		t.Fatalf("executable shared hook rejected: %v", err)
+
+	link := filepath.Join(dir, "services-start-link")
+	if err := os.Symlink(path, link); err == nil {
+		if _, err := validateMerlinSharedHookPath(link, false); err == nil {
+			t.Fatal("expected shared-hook symlink to be rejected")
+		}
 	}
 }
 
