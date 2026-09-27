@@ -206,9 +206,18 @@ func (m *Merlin) writeDnsmasqPostconf() error {
 }
 
 func (m *Merlin) writeDnsmasqPostconfFile(path string) error {
+	_, statErr := os.Lstat(path)
+	createdByCtrld := os.IsNotExist(statErr)
+	if statErr != nil && !createdByCtrld {
+		return statErr
+	}
+
 	buf, err := os.ReadFile(path)
-	if err != nil && !os.IsNotExist(err) {
-		return err
+	if err != nil {
+		if !createdByCtrld || !os.IsNotExist(err) {
+			return err
+		}
+		buf = nil
 	}
 
 	data, err := dnsmasq.ConfTmpl(dnsmasq.MerlinPostConfTmpl, m.cfg)
@@ -222,7 +231,15 @@ func (m *Merlin) writeDnsmasqPostconfFile(path string) error {
 		dnsmasq.MerlinPostConfEndMarker,
 	}, "\n")
 
-	return atomicWriteFile(path, merlinUpsertPostConf(buf, []byte(block)), 0750)
+	if err := atomicWriteFile(path, merlinUpsertPostConf(buf, []byte(block)), 0750); err != nil {
+		return err
+	}
+	if createdByCtrld {
+		if err := atomicWriteFile(merlinPostConfCreatedMarker(path), []byte("created\n"), 0600); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func cleanupDnsmasqPostconf(path string) error {
@@ -235,14 +252,24 @@ func cleanupDnsmasqPostconf(path string) error {
 	}
 
 	clean := merlinParsePostConf(buf)
-	if len(bytes.TrimSpace(clean)) == 0 || bytes.Equal(bytes.TrimSpace(clean), []byte("#!/bin/sh")) {
+	marker := merlinPostConfCreatedMarker(path)
+	if fileExists(marker) && (len(bytes.TrimSpace(clean)) == 0 || bytes.Equal(bytes.TrimSpace(clean), []byte("#!/bin/sh"))) {
 		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		if err := os.Remove(marker); err != nil && !os.IsNotExist(err) {
 			return err
 		}
 		return nil
 	}
 
-	return atomicWriteFile(path, clean, 0750)
+	if err := atomicWriteFile(path, clean, 0750); err != nil {
+		return err
+	}
+	if err := os.Remove(marker); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
 }
 
 // restartDNSMasq restarts the dnsmasq service by executing the appropriate system command using "service".
@@ -347,12 +374,31 @@ func merlinUpsertPostConf(buf, block []byte) []byte {
 	return []byte("#!/bin/sh\n\n" + string(block) + "\n\n" + string(clean) + "\n")
 }
 
+func merlinPostConfCreatedMarker(path string) string {
+	return path + ".ctrld-created"
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
 // atomicWriteFile replaces path only after a complete sibling temporary file
 // has been written, synced, closed and chmodded. This avoids truncating a shared
 // Merlin hook if JFFS fills up or a short write occurs.
 func atomicWriteFile(path string, data []byte, mode os.FileMode) (err error) {
-	dir := filepath.Dir(path)
-	base := filepath.Base(path)
+	target := path
+	if info, lstatErr := os.Lstat(path); lstatErr == nil && info.Mode()&os.ModeSymlink != 0 {
+		target, err = filepath.EvalSymlinks(path)
+		if err != nil {
+			return err
+		}
+	} else if lstatErr != nil && !os.IsNotExist(lstatErr) {
+		return lstatErr
+	}
+
+	dir := filepath.Dir(target)
+	base := filepath.Base(target)
 	tmp, err := os.CreateTemp(dir, "."+base+".ctrld-*")
 	if err != nil {
 		return err
@@ -377,7 +423,7 @@ func atomicWriteFile(path string, data []byte, mode os.FileMode) (err error) {
 	if err = tmp.Close(); err != nil {
 		return err
 	}
-	if err = os.Rename(tmpName, path); err != nil {
+	if err = os.Rename(tmpName, target); err != nil {
 		return err
 	}
 	return nil
