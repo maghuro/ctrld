@@ -793,11 +793,13 @@ func initRestartCmd() *cobra.Command {
 				if router.WaitProcessExited() {
 					ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
 					defer cancel()
+
+				loop:
 					for {
 						select {
 						case <-ctx.Done():
 							mainLog.Load().Error().Msg("timeout while waiting for service to stop")
-							goto normalStart
+							break loop
 						default:
 						}
 						time.Sleep(time.Second)
@@ -806,7 +808,6 @@ func initRestartCmd() *cobra.Command {
 						}
 					}
 				}
-			normalStart:
 				return doTasks([]task{{s.Start, true, "Start"}})
 			}
 
@@ -1378,11 +1379,13 @@ func initUpgradeCmd() *cobra.Command {
 					if doTasks(tasks) && router.WaitProcessExited() {
 						ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
 						defer cancel()
+
+					loop:
 						for {
 							select {
 							case <-ctx.Done():
 								mainLog.Load().Error().Msg("timeout while waiting for service to stop")
-								goto upgradeStart
+								break loop
 							default:
 							}
 							time.Sleep(time.Second)
@@ -1391,7 +1394,6 @@ func initUpgradeCmd() *cobra.Command {
 							}
 						}
 					}
-				upgradeStart:
 					if !doTasks([]task{{s.Start, true, "Start"}}) {
 						return false
 					}
