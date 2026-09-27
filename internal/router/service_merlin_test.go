@@ -266,7 +266,7 @@ func TestMerlinLegacyStartupHookLinesRemainRemovable(t *testing.T) {
 }
 
 
-func TestReadMerlinStartupScriptRejectsSymlink(t *testing.T) {
+func TestPrepareExistingMerlinStartupScriptRejectsSymlink(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("symlink creation may require elevated privileges on Windows")
 	}
@@ -280,7 +280,7 @@ func TestReadMerlinStartupScriptRejectsSymlink(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, exists, err := readMerlinStartupScript(link); err == nil || !exists {
+	if exists, err := prepareExistingMerlinStartupScript(link, []byte("private\n")); err == nil || !exists {
 		t.Fatalf("symlink startup script = (exists %v, err %v), want exists=true and error", exists, err)
 	}
 	got, err := os.ReadFile(target)
@@ -292,17 +292,44 @@ func TestReadMerlinStartupScriptRejectsSymlink(t *testing.T) {
 	}
 }
 
-func TestReadMerlinStartupScriptReadsRegularFile(t *testing.T) {
+func TestPrepareExistingMerlinStartupScriptRegularFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "ctrld.startup")
 	want := []byte("#!/bin/sh\n")
-	if err := os.WriteFile(path, want, 0700); err != nil {
+	if err := os.WriteFile(path, want, 0600); err != nil {
 		t.Fatal(err)
 	}
-	got, exists, err := readMerlinStartupScript(path)
+	exists, err := prepareExistingMerlinStartupScript(path, want)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !exists || !bytes.Equal(got, want) {
-		t.Fatalf("regular startup script = (%q, %v), want (%q, true)", got, exists, want)
+	if !exists {
+		t.Fatal("regular startup script reported missing")
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("regular startup script = %q, want %q", got, want)
+	}
+	if runtime.GOOS != "windows" {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if gotMode := info.Mode().Perm(); gotMode != 0755 {
+			t.Fatalf("regular startup script mode = %o, want 755", gotMode)
+		}
+	}
+}
+
+func TestPrepareExistingMerlinStartupScriptMissing(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ctrld.startup")
+	exists, err := prepareExistingMerlinStartupScript(path, []byte("#!/bin/sh\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exists {
+		t.Fatal("missing startup script reported as existing")
 	}
 }
