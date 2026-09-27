@@ -88,8 +88,11 @@ func Test_merlinPostConfDoesNotExitHostHook(t *testing.T) {
 		t.Fatal("ctrld postconf block must not terminate the enclosing Merlin hook")
 	}
 	trimmed := strings.TrimSpace(dnsmasq.MerlinPostConfTmpl)
-	if !strings.HasPrefix(trimmed, "(") || !strings.HasSuffix(trimmed, ")") {
-		t.Fatal("ctrld postconf block must run in a subshell to isolate shared-hook variables")
+	if !strings.HasPrefix(trimmed, "(\n") || !strings.HasSuffix(trimmed, "\n)") {
+		t.Fatal("ctrld postconf block must run in a newline-delimited subshell to isolate shared-hook variables")
+	}
+	if strings.Contains(dnsmasq.MerlinPostConfTmpl, `\nconfig_file`) {
+		t.Fatal("raw Merlin postconf template must contain a real newline, not a literal \\n escape")
 	}
 }
 
