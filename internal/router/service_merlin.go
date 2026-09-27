@@ -137,11 +137,6 @@ func (s *merlinSvc) Install() error {
 	}
 
 	confPath := s.configPath()
-	if _, err := os.Stat(confPath); err == nil {
-		return fmt.Errorf("already installed: %s", confPath)
-	} else if !os.IsNotExist(err) {
-		return fmt.Errorf("os.Stat: startup script: %w", err)
-	}
 
 	var to = &struct {
 		*service.Config
@@ -157,17 +152,35 @@ func (s *merlinSvc) Install() error {
 	if err := s.template().Execute(&rendered, to); err != nil {
 		return fmt.Errorf("s.template.Execute: %w", err)
 	}
-	startupPublished, err := writeMerlinStartupScript(confPath, rendered.Bytes(), 0755)
-	if err != nil {
-		if startupPublished {
-			_ = os.Remove(confPath)
-			_ = syncMerlinServiceDir(filepath.Dir(confPath))
+	startupPublished := false
+	existing, err := os.ReadFile(confPath)
+	switch {
+	case err == nil:
+		if !bytes.Equal(existing, rendered.Bytes()) {
+			return fmt.Errorf("already installed with different startup script: %s", confPath)
 		}
-		return fmt.Errorf("publish startup script: %w", err)
+		// An interrupted previous install may have published the private startup
+		// script before adding both shared hooks. Identical bytes prove that this
+		// install can safely resume instead of getting stuck on "already installed".
+		if err := os.Chmod(confPath, 0755); err != nil {
+			return fmt.Errorf("os.Chmod: startup script: %w", err)
+		}
+	case os.IsNotExist(err):
+		startupPublished, err = writeMerlinStartupScript(confPath, rendered.Bytes(), 0755)
+		if err != nil {
+			if startupPublished {
+				_ = os.Remove(confPath)
+				_ = syncMerlinServiceDir(filepath.Dir(confPath))
+			}
+			return fmt.Errorf("publish startup script: %w", err)
+		}
+	default:
+		return fmt.Errorf("read startup script: %w", err)
 	}
+
 	installComplete := false
 	defer func() {
-		if !installComplete {
+		if !installComplete && startupPublished {
 			_ = os.Remove(confPath)
 			_ = syncMerlinServiceDir(filepath.Dir(confPath))
 		}
