@@ -198,8 +198,10 @@ func (m *Merlin) cleanupDnsmasqJffs(cfg *dnsmasqConfig) error {
 // merlinHookUpdate is prepared entirely before any shared hook is modified.
 // This lets us validate/read both Merlin hook paths before the first write.
 type merlinHookUpdate struct {
-	path string
-	data []byte
+	path     string
+	data     []byte
+	original []byte
+	existed  bool
 }
 
 // writeDnsmasqPostconf installs ctrld-owned blocks in Merlin's main and SDN
@@ -233,9 +235,37 @@ func writeMerlinHookUpdates(paths []string, block []byte) error {
 		updates = append(updates, update)
 	}
 
+	written := make([]merlinHookUpdate, 0, len(updates))
 	for _, update := range updates {
 		if err := atomicWriteFile(update.path, update.data, 0750); err != nil {
-			return err
+			if rollbackErr := rollbackMerlinHookUpdates(written); rollbackErr != nil {
+				return fmt.Errorf("write Merlin hook %s: %w; rollback failed: %v", update.path, err, rollbackErr)
+			}
+			return fmt.Errorf("write Merlin hook %s: %w", update.path, err)
+		}
+		written = append(written, update)
+	}
+	return nil
+}
+
+func rollbackMerlinHookUpdates(updates []merlinHookUpdate) error {
+	for i := len(updates) - 1; i >= 0; i-- {
+		update := updates[i]
+		current, err := os.ReadFile(update.path)
+		if err != nil {
+			return fmt.Errorf("read %s during rollback: %w", update.path, err)
+		}
+		if !bytes.Equal(current, update.data) {
+			return fmt.Errorf("refusing to roll back %s after external modification", update.path)
+		}
+		if update.existed {
+			if err := atomicWriteFile(update.path, update.original, 0750); err != nil {
+				return fmt.Errorf("restore %s: %w", update.path, err)
+			}
+			continue
+		}
+		if err := os.Remove(update.path); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("remove newly created %s: %w", update.path, err)
 		}
 	}
 	return nil
@@ -256,9 +286,12 @@ func prepareMerlinHookUpdate(path string, block []byte) (merlinHookUpdate, error
 		buf = nil
 	}
 
+	original := append([]byte(nil), buf...)
 	return merlinHookUpdate{
-		path: path,
-		data: merlinUpsertPostConf(buf, block),
+		path:     path,
+		data:     merlinUpsertPostConf(buf, block),
+		original: original,
+		existed:  !pathMissing,
 	}, nil
 }
 
