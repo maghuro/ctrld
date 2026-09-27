@@ -545,7 +545,10 @@ func (m *Merlin) setupMainDnsmasqFallback() error {
 	if err := atomicWriteFile(merlinSnapshotStatePath, []byte("sha256="+hash+"\n"), 0600); err != nil {
 		return fmt.Errorf("mark ctrld dnsmasq fallback ownership: %w", err)
 	}
-	if err := atomicWriteFile(dnsmasq.MerlinJffsConfPath, built, 0644); err != nil {
+	// Publish without replacement semantics. Between the earlier ownership
+	// check and this point an administrator/addon may legitimately create a new
+	// dnsmasq.conf; ctrld must never clobber that concurrently-created file.
+	if err := writeFileNoReplace(dnsmasq.MerlinJffsConfPath, built, 0644); err != nil {
 		current, readErr := os.ReadFile(dnsmasq.MerlinJffsConfPath)
 		switch {
 		case readErr == nil && merlinSnapshotHash(current) == hash:
@@ -570,6 +573,50 @@ func (m *Merlin) setupMainDnsmasqFallback() error {
 		}
 	}
 	return nil
+}
+
+func writeFileNoReplace(target string, data []byte, mode os.FileMode) error {
+	dir := filepath.Dir(target)
+	base := filepath.Base(target)
+	tmp, err := os.CreateTemp(dir, "."+base+".ctrld-noreplace-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	cleanup := true
+	defer func() {
+		_ = tmp.Close()
+		if cleanup {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+
+	if err := tmp.Chmod(mode); err != nil {
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+
+	// link(2) is atomic with respect to target existence and never replaces an
+	// existing pathname. The temporary file lives in the same directory/filesystem.
+	if err := os.Link(tmpPath, target); err != nil {
+		return err
+	}
+	if err := os.Remove(tmpPath); err != nil {
+		// The target is already published and valid; retain normal publication
+		// semantics but report cleanup failure to the caller for reconciliation.
+		cleanup = false
+		return err
+	}
+	cleanup = false
+	return syncParentDir(dir)
 }
 
 func (m *Merlin) buildMainDnsmasqFallback(buf []byte) ([]byte, error) {
