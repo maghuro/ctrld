@@ -776,7 +776,7 @@ func cleanupOwnedMainSnapshot() error {
 	case snapshotPhaseQuarantine:
 		return cleanupQuarantinedMainSnapshot(state)
 	case snapshotPhaseDelete:
-		return finalizeOwnedMainSnapshotDelete()
+		return finalizeOwnedMainSnapshotDelete(state)
 	case snapshotPhaseRestore:
 		return restoreQuarantinedMainSnapshot(state)
 	case snapshotPhaseRestored:
@@ -867,15 +867,15 @@ func cleanupQuarantinedMainSnapshot(state mainSnapshotState) error {
 		return cleanupOwnedMainSnapshot()
 	}
 
-	same, err := sameFilePaths(merlinSnapshotQuarantinePath, merlinSnapshotAnchorPath)
+	owned, err := snapshotFileStillOwned(
+		merlinSnapshotQuarantinePath,
+		merlinSnapshotAnchorPath,
+		state.hash,
+	)
 	if err != nil {
 		return err
 	}
-	buf, err := os.ReadFile(merlinSnapshotQuarantinePath)
-	if err != nil {
-		return fmt.Errorf("read quarantined Merlin fallback: %w", err)
-	}
-	if same && merlinSnapshotHash(buf) == state.hash {
+	if owned {
 		state.phase = snapshotPhaseDelete
 	} else {
 		// Different inode or changed bytes mean user/addon ownership may have
@@ -888,7 +888,60 @@ func cleanupQuarantinedMainSnapshot(state mainSnapshotState) error {
 	return cleanupOwnedMainSnapshot()
 }
 
-func finalizeOwnedMainSnapshotDelete() error {
+func snapshotFileStillOwned(path, anchor, expectedHash string) (bool, error) {
+	pathExistsNow, err := pathExists(path)
+	if err != nil {
+		return false, err
+	}
+	if !pathExistsNow {
+		return false, nil
+	}
+	anchorExists, err := pathExists(anchor)
+	if err != nil {
+		return false, err
+	}
+	if !anchorExists {
+		return false, nil
+	}
+	same, err := sameFilePaths(path, anchor)
+	if err != nil {
+		return false, err
+	}
+	if !same {
+		return false, nil
+	}
+	buf, err := os.ReadFile(path)
+	if err != nil {
+		return false, err
+	}
+	return merlinSnapshotHash(buf) == expectedHash, nil
+}
+
+func finalizeOwnedMainSnapshotDelete(state mainSnapshotState) error {
+	quarantineExists, err := pathExists(merlinSnapshotQuarantinePath)
+	if err != nil {
+		return err
+	}
+	if quarantineExists {
+		// Revalidate immediately before finalization. A process may have kept a
+		// writable descriptor open across the public->quarantine rename and
+		// changed the inode after the earlier classification.
+		owned, err := snapshotFileStillOwned(
+			merlinSnapshotQuarantinePath,
+			merlinSnapshotAnchorPath,
+			state.hash,
+		)
+		if err != nil {
+			return err
+		}
+		if !owned {
+			state.phase = snapshotPhaseRestore
+			if err := writeMainSnapshotState(state); err != nil {
+				return fmt.Errorf("journal late-modified Merlin fallback restoration: %w", err)
+			}
+			return cleanupOwnedMainSnapshot()
+		}
+	}
 	if err := removeFileDurable(merlinSnapshotQuarantinePath); err != nil {
 		return fmt.Errorf("remove quarantined ctrld fallback: %w", err)
 	}
@@ -1534,7 +1587,11 @@ func pathExists(path string) (bool, error) {
 func removeFileDurable(path string) error {
 	err := os.Remove(path)
 	if os.IsNotExist(err) {
-		return nil
+		// The previous attempt may have unlinked the file successfully but
+		// failed while syncing the directory. Re-sync even on ENOENT so a retry
+		// can make that already-visible deletion durable before its journal is
+		// advanced or removed.
+		return syncParentDir(filepath.Dir(path))
 	}
 	if err != nil {
 		return err
