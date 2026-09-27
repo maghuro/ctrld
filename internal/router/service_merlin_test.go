@@ -196,3 +196,30 @@ func TestMerlinServiceEventValidatesDnsmasqPidOwnership(t *testing.T) {
 		}
 	}
 }
+
+
+func TestValidateMerlinSharedHookRequiresExecutable(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "services-start")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateMerlinSharedHook(path, info); err == nil {
+		t.Fatal("expected non-executable shared hook to be rejected")
+	}
+
+	if err := os.Chmod(path, 0755); err != nil {
+		t.Fatal(err)
+	}
+	info, err = os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateMerlinSharedHook(path, info); err != nil {
+		t.Fatalf("executable shared hook rejected: %v", err)
+	}
+}
