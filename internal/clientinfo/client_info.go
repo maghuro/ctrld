@@ -118,7 +118,7 @@ func (t *Table) AddLeaseFile(name string, format ctrld.LeaseFileFormat) {
 	if !t.discoverDHCP() {
 		return
 	}
-	clientInfoFiles[name] = format
+	setClientInfoFile(name, format)
 }
 
 // RefreshLoop runs all the refresher to update new client info data.
