@@ -264,3 +264,45 @@ func TestMerlinLegacyStartupHookLinesRemainRemovable(t *testing.T) {
 		t.Fatalf("legacy service-event hook = %q", event)
 	}
 }
+
+
+func TestReadMerlinStartupScriptRejectsSymlink(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation may require elevated privileges on Windows")
+	}
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target")
+	link := filepath.Join(dir, "ctrld.startup")
+	if err := os.WriteFile(target, []byte("private\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, exists, err := readMerlinStartupScript(link); err == nil || !exists {
+		t.Fatalf("symlink startup script = (exists %v, err %v), want exists=true and error", exists, err)
+	}
+	got, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "private\n" {
+		t.Fatalf("symlink target was modified: %q", got)
+	}
+}
+
+func TestReadMerlinStartupScriptReadsRegularFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ctrld.startup")
+	want := []byte("#!/bin/sh\n")
+	if err := os.WriteFile(path, want, 0700); err != nil {
+		t.Fatal(err)
+	}
+	got, exists, err := readMerlinStartupScript(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !exists || !bytes.Equal(got, want) {
+		t.Fatalf("regular startup script = (%q, %v), want (%q, true)", got, exists, want)
+	}
+}
